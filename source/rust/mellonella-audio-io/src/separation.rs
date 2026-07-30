@@ -471,6 +471,7 @@ fn fade_and_clamp(samples: &mut [f32]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 

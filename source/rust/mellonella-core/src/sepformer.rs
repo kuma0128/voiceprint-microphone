@@ -67,7 +67,7 @@ impl SepformerSession {
             "mix" => TensorRef::from_array_view(([1_usize, SEPFORMER_BLOCK_SAMPLES], mixture))?,
         ])?;
         let (shape, data) = outputs["streams"].try_extract_tensor::<f32>()?;
-        let dims: &[i64] = &shape;
+        let dims: &[i64] = shape;
         if dims != [1, SEPFORMER_BLOCK_SAMPLES as i64, SEPFORMER_STREAMS as i64] {
             return Err(EmbeddingError::UnexpectedOutputShape {
                 got: dims.to_vec(),

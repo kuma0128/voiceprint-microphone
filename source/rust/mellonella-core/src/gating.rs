@@ -314,6 +314,16 @@ impl GateState {
         self.is_on
     }
 
+    /// Replace the live gate parameters without resetting the current
+    /// decision, hangover timer, or adaptive statistics.
+    ///
+    /// This is intentionally different from constructing a fresh
+    /// [`GateState`]: a settings slider must not create an audible gate
+    /// close/open cycle every time it moves.
+    pub fn set_config(&mut self, config: GateConfig) {
+        self.config = config;
+    }
+
     /// Static pass threshold for the active scoring mode.
     fn static_theta_pass(&self) -> f32 {
         if self.config.use_as_norm {
@@ -412,6 +422,13 @@ impl EnvelopeState {
 
     pub fn set_value(&mut self, v: f32) {
         self.value = v;
+    }
+
+    /// Replace attack/release parameters while preserving the current
+    /// envelope value. Keeping the value avoids a click when live tuning
+    /// is changed during a call.
+    pub fn set_config(&mut self, config: GateConfig) {
+        self.config = config;
     }
 
     fn coef(&self, ms: f32) -> f32 {
@@ -721,6 +738,51 @@ mod tests {
         let mut gate = GateState::new(GateConfig::default());
         assert!(gate.update(0.9, 20.0, true));
         assert!(gate.is_on());
+    }
+
+    #[test]
+    fn live_gate_reconfigure_preserves_open_state_and_timer() {
+        let initial = GateConfig {
+            adaptive_theta: false,
+            hangover_ms: 300.0,
+            ..GateConfig::default()
+        };
+        let mut gate = GateState::new(initial);
+        assert!(gate.update(0.9, 32.0, true));
+        // Consume part of the old hangover, then move the live slider.
+        // Reconfiguration must neither reset nor snap the gate shut.
+        assert!(gate.update(0.0, 100.0, true));
+        gate.set_config(GateConfig {
+            theta_pass: 0.8,
+            adaptive_theta: false,
+            hangover_ms: 500.0,
+            ..initial
+        });
+        assert!(gate.is_on());
+        assert!(gate.update(0.0, 350.0, true));
+        assert!(!gate.update(0.0, 50.0, true));
+    }
+
+    #[test]
+    fn live_envelope_reconfigure_preserves_gain() {
+        let initial = GateConfig {
+            attack_ms: 0.0,
+            release_ms: 100.0,
+            ..GateConfig::default()
+        };
+        let mut envelope = EnvelopeState::new(initial, 1_000);
+        envelope.advance(true, 1);
+        assert!((envelope.value() - 1.0).abs() < 1e-6);
+        envelope.set_config(GateConfig {
+            release_ms: 400.0,
+            ..initial
+        });
+        assert!((envelope.value() - 1.0).abs() < 1e-6);
+        let released = envelope.advance(false, 1)[0];
+        assert!(
+            released > 0.99,
+            "new slow release should apply live: {released}"
+        );
     }
 
     #[test]

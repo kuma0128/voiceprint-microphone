@@ -14,6 +14,8 @@
 //! Set `MELLONELLA_ORT_INTRA_THREADS` to compare thread counts; that is
 //! how the heuristic in [`mellonella_core::ort_threads`] was chosen.
 
+#![allow(clippy::cast_precision_loss)]
+
 use std::time::Instant;
 
 use mellonella_core::embedding::EcapaTdnn;

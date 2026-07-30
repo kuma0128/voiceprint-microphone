@@ -76,7 +76,7 @@ mod session;
 pub use devices::{list_input_devices, list_output_devices, AudioDevice, DeviceKind};
 pub use recording::Recorder;
 pub use separation::{build_separator_enrollment_pool, SeparatorTuning};
-pub use session::{LiveSession, LiveSessionStats, SessionConfig, SessionEvent};
+pub use session::{GateTuning, LiveSession, LiveSessionStats, SessionConfig, SessionEvent};
 
 /// Errors surfaced by the audio-IO crate.
 #[derive(Debug)]

@@ -202,6 +202,17 @@ pub struct StreamingConfig {
     /// interlocutor pause doesn't flap the chain back through a
     /// reset cycle.
     pub overlap_hold_off_ms: f32,
+    /// When adaptive routing is in [`ChainMode::Overlap`], let the
+    /// target-speaker extractor own speaker selection and keep the
+    /// outer speaker gate open for VAD-positive audio.
+    ///
+    /// The ordinary gate scores the raw two-speaker mixture. A louder
+    /// interferer can therefore pull that score below threshold and
+    /// mute the enrolled speaker even though TSE has extracted them
+    /// correctly. Enabling this option removes that contradictory
+    /// second decision. Solo mode is unchanged and still requires the
+    /// enrolled voiceprint.
+    pub overlap_bypass_speaker_gate: bool,
     /// Post-chain makeup gain (dB) applied while
     /// [`crate::streaming::ChainMode::Solo`] is active. The DFN3-only
     /// solo path attenuates real speech by ~4-6 dB RMS as a side
@@ -336,6 +347,7 @@ impl Default for StreamingConfig {
             overlap_threshold: 0.10,
             overlap_hold_on_ms: 500.0,
             overlap_hold_off_ms: 2_000.0,
+            overlap_bypass_speaker_gate: false,
             makeup_gain_db_solo: 5.0,
             makeup_gain_db_overlap: 0.0,
             chain_soft_clip: true,
@@ -954,6 +966,27 @@ pub enum ChainMode {
     /// mask-based suppression covers the noise case sufficiently
     /// during overlap.
     Overlap,
+}
+
+/// Resolve the final gate after the ordinary voiceprint decision and
+/// the adaptive overlap route have both run. Kept as a pure helper so
+/// the security-sensitive "TSE owns overlap selection, voiceprint owns
+/// solo selection" contract is directly testable without ONNX models.
+#[allow(clippy::fn_params_excessive_bools)]
+fn final_gate_decision(
+    adaptive: bool,
+    chain_mode: ChainMode,
+    overlap_bypass_speaker_gate: bool,
+    now_speech: bool,
+    is_on_score: bool,
+    silence_forced_off: bool,
+    turn_forced_off: bool,
+) -> bool {
+    if adaptive && chain_mode == ChainMode::Overlap && overlap_bypass_speaker_gate {
+        now_speech
+    } else {
+        is_on_score && !silence_forced_off && !turn_forced_off
+    }
 }
 
 /// Persistent worker thread for `async_refresh = true` streaming.
@@ -1896,15 +1929,31 @@ impl StreamingState {
             self.score.last_score
         };
 
+        // Update routing before choosing the final gate state. In
+        // Overlap mode TSE has already been conditioned on the trusted
+        // enrollment; scoring the louder raw mixture a second time is
+        // both redundant and the main source of target-voice dropouts.
+        let adaptive = self.overlap_detector.is_some()
+            && self.tse_stage.is_some()
+            && self.dfn3_stream.is_some();
+        if adaptive {
+            self.update_chain_mode(decision_frame, dt_ms, config)?;
+        }
+
         let is_on_score = self.gate_state.update(gate_score, dt_ms, now_speech);
-        let is_on = is_on_score
-            && !(pipeline_cfg.silence_force_off_ms > 0.0
-                && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms)
+        let silence_forced_off = pipeline_cfg.silence_force_off_ms > 0.0
+            && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms;
+        let is_on = final_gate_decision(
+            adaptive,
+            self.chain_mode,
+            config.overlap_bypass_speaker_gate,
+            now_speech,
+            is_on_score,
+            silence_forced_off,
             // Stage B, Part 2: offset fail-closed — an extra AND term
-            // parallel to the silence rule, OUTSIDE `gate_state.update`
-            // so it bypasses the gate hangover. Cleared once a refresh
-            // on the shrunk window lands.
-            && !self.turn.offset_failclosed_active;
+            // parallel to the silence rule, outside `gate_state.update`.
+            self.turn.offset_failclosed_active,
+        );
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
             // Stage B, Part 1: with the fast cue on, the diagnostics
@@ -1926,17 +1975,6 @@ impl StreamingState {
         // span. `EnvelopeState::advance` returns one gain per
         // sample.
         let gain = self.envelope_state.advance(is_on, audio_chunk.len());
-        // Run the overlap detector (when configured) and update the
-        // chain-routing state machine. Hysteresis lives here so a
-        // transient blip in the detector's output doesn't flap the
-        // chain.
-        let adaptive = self.overlap_detector.is_some()
-            && self.tse_stage.is_some()
-            && self.dfn3_stream.is_some();
-        if adaptive {
-            self.update_chain_mode(decision_frame, dt_ms, config)?;
-        }
-
         if self.tse_stage.is_some() || self.dfn3_stream.is_some() {
             // Stage C, Phase 5: route this frame's audio through the
             // optional audio chain (TSE / DFN3, or both when
@@ -2774,6 +2812,33 @@ impl StreamingPipeline {
         &mut self.pool
     }
 
+    /// Apply gate/envelope settings without rebuilding ONNX sessions or
+    /// resetting live state. This is safe between `push_samples` calls
+    /// (the public API already requires `&mut self`).
+    pub fn set_gate_config(&mut self, gate: GateConfig) {
+        self.config.gate = gate;
+        self.state.gate_state.set_config(gate);
+        self.state.envelope_state.set_config(gate);
+    }
+
+    /// Current gate configuration, including any live updates.
+    #[must_use]
+    pub fn gate_config(&self) -> GateConfig {
+        self.config.gate
+    }
+
+    /// Most recently computed speaker-verification score.
+    #[must_use]
+    pub fn last_score(&self) -> f32 {
+        self.state.score.last_score
+    }
+
+    /// Threshold actually used by the gate after optional adaptation.
+    #[must_use]
+    pub fn effective_gate_threshold(&self) -> f32 {
+        self.state.gate_state.effective_theta_pass()
+    }
+
     /// Reset stateful pieces (rings, gate, envelope, frame index)
     /// **without** rebuilding ONNX sessions or tearing down the
     /// async worker thread (if any). Pool is preserved.
@@ -2844,6 +2909,50 @@ impl StreamingPipeline {
 #[allow(clippy::float_cmp, clippy::cast_precision_loss)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlap_bypass_uses_tse_vad_instead_of_raw_mixture_score() {
+        assert!(final_gate_decision(
+            true,
+            ChainMode::Overlap,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!final_gate_decision(
+            true,
+            ChainMode::Overlap,
+            true,
+            false,
+            true,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn solo_mode_always_keeps_voiceprint_fail_closed() {
+        assert!(!final_gate_decision(
+            true,
+            ChainMode::Solo,
+            true,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(final_gate_decision(
+            true,
+            ChainMode::Solo,
+            true,
+            true,
+            true,
+            false,
+            false,
+        ));
+    }
 
     #[test]
     fn streaming_config_default_is_dual_rate() {

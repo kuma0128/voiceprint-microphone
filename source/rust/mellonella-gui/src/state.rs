@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use mellonella_audio_io::{
     build_separator_enrollment_pool, list_input_devices, list_output_devices, AudioDevice,
-    LiveSession, LiveSessionStats, Recorder, SeparatorTuning, SessionConfig, SessionEvent,
+    GateTuning, LiveSession, LiveSessionStats, Recorder, SeparatorTuning, SessionConfig,
+    SessionEvent,
 };
 use mellonella_core::embedding::EcapaTdnn;
 use mellonella_core::enrollment::{EmbeddingPool, EmbeddingPoolConfig};
@@ -47,6 +48,13 @@ pub const MIN_ENROLLMENT_ANCHORS: usize = 6;
 /// even across different vowels and pitch. Below this median the
 /// profile is usually dominated by noise, clipping, or another voice.
 const MIN_ENROLLMENT_CONSISTENCY: f32 = 0.40;
+/// Voiceprint controls calibrated for the bundled microphone/profile.
+/// The old 0.30 threshold was permissive enough for a loud same-gender
+/// interferer; the longer hangover compensates for the stricter score
+/// without chattering on a single low-scoring vowel.
+pub const DEFAULT_GATE_THRESHOLD: f32 = 0.45;
+pub const DEFAULT_GATE_HANGOVER_MS: f32 = 500.0;
+pub const DEFAULT_GATE_RELEASE_MS: f32 = 120.0;
 
 /// Where the current enrollment came from. Surfaced in the UI so
 /// users see "Recorded 5.0 s" vs the auto-loaded persistent pool.
@@ -98,6 +106,8 @@ pub struct AppState {
     /// when building the `SessionConfig`. Defaults match
     /// `GateConfig::default()`.
     pub gate_cfg: GateConfig,
+    /// Lock-free live controls shared with the running audio worker.
+    pub gate_tuning: Arc<GateTuning>,
     /// User-adjustable pipeline cadence (currently just
     /// `sv_update_samples` — ECAPA refresh interval). Sliders in
     /// the Settings panel mutate this; defaults match
@@ -141,6 +151,8 @@ impl Default for AppState {
                 .ok()
                 .filter(|path| path.exists())
             });
+        let gate_cfg = load_gate_config();
+        let gate_tuning = Arc::new(GateTuning::new(gate_cfg));
         let mut state = Self {
             pool: None,
             separator_pool: None,
@@ -155,17 +167,8 @@ impl Default for AppState {
             selected_output,
             tse_onnx_path,
             record_duration_secs: DEFAULT_RECORD_SECS,
-            gate_cfg: GateConfig {
-                // The upstream Japanese/noisy calibration recommends
-                // 0.30. The previous 0.42 default caused false rejects
-                // of the enrolled user and forced them onto the
-                // destructive 8 kHz fallback path.
-                theta_pass: 0.30,
-                adaptive_theta: false,
-                hangover_ms: 200.0,
-                release_ms: 80.0,
-                ..GateConfig::default()
-            },
+            gate_cfg,
+            gate_tuning,
             pipeline_cfg: default_live_pipeline_cfg(),
             separator_tuning: Arc::new(SeparatorTuning::new(load_separator_threshold())),
             pending_append: false,
@@ -311,6 +314,48 @@ pub fn separator_threshold_path() -> Option<PathBuf> {
     Some(dir.join("separator-threshold.txt"))
 }
 
+/// Persisted live gate controls. A small text format keeps this
+/// backward-compatible and lets a damaged file fall back atomically to
+/// safe defaults: `<threshold> <hangover_ms> <release_ms>`.
+#[must_use]
+pub fn gate_settings_path() -> Option<PathBuf> {
+    let dir = dirs::config_dir()?.join("mellonella");
+    Some(dir.join("gate-settings.txt"))
+}
+
+fn default_gate_config() -> GateConfig {
+    GateConfig {
+        theta_pass: DEFAULT_GATE_THRESHOLD,
+        adaptive_theta: false,
+        hangover_ms: DEFAULT_GATE_HANGOVER_MS,
+        release_ms: DEFAULT_GATE_RELEASE_MS,
+        ..GateConfig::default()
+    }
+}
+
+fn load_gate_config() -> GateConfig {
+    let mut config = default_gate_config();
+    let Some(text) = gate_settings_path().and_then(|path| std::fs::read_to_string(path).ok())
+    else {
+        return config;
+    };
+    let values: Vec<f32> = text
+        .split_whitespace()
+        .filter_map(|part| part.parse::<f32>().ok())
+        .collect();
+    if let [threshold, hangover_ms, release_ms, ..] = values.as_slice() {
+        if (0.15..=0.85).contains(threshold)
+            && (100.0..=1_200.0).contains(hangover_ms)
+            && (30.0..=400.0).contains(release_ms)
+        {
+            config.theta_pass = *threshold;
+            config.hangover_ms = *hangover_ms;
+            config.release_ms = *release_ms;
+        }
+    }
+    config
+}
+
 /// Load the persisted separator threshold, falling back to the library
 /// default when the file is missing, unreadable, or out of range.
 fn load_separator_threshold() -> f32 {
@@ -327,13 +372,15 @@ fn load_separator_threshold() -> f32 {
 /// `PipelineConfig::default()` keep passing) but that matter for
 /// real-time mic use:
 ///
-/// * `silence_force_off_ms = 400` — close the gate immediately after
-///   400 ms of continuous VAD-silence. Longer than a typical
-///   inter-word pause (~250 ms) so normal speech doesn't trip it,
-///   but short enough that the gate closes within ~500 ms of the
-///   user actually stopping (400 ms + 100 ms envelope `release_ms`).
-/// * `score_ema_alpha = 0.7` — smooth `last_score` updates across
-///   refreshes to ride out one-refresh dips at speech onset.
+/// * `silence_force_off_ms = 700` — ignore ordinary inter-word pauses
+///   while still preventing an old score from holding the gate open
+///   indefinitely in an empty room.
+/// * `sv_window_samples = 12_000`, `sv_update_samples = 4_000` — use a
+///   750 ms identity window refreshed every 250 ms, reducing both the
+///   initial verification delay and time spent passing a changed
+///   speaker compared with the old 1 s / 500 ms cadence.
+/// * `score_ema_alpha = 0.9` — react quickly to the newer speaker
+///   embedding; gate hangover handles isolated target-score dips.
 /// * `sv_min_new_samples_after_silence = 1600` — fire the
 ///   post-silence early refresh after only 100 ms of new speech
 ///   (instead of the library-default 250 ms) so `last_score` catches
@@ -342,8 +389,17 @@ fn load_separator_threshold() -> f32 {
 #[must_use]
 pub fn default_live_pipeline_cfg() -> PipelineConfig {
     PipelineConfig {
-        silence_force_off_ms: 400.0,
-        score_ema_alpha: 0.85,
+        // Do not close inside a natural sentence pause. Score-side
+        // hangover still rejects a changed speaker; this rule exists
+        // only to prevent a stale gate from remaining open in silence.
+        silence_force_off_ms: 700.0,
+        // A 750 ms window reacts to a speaker change sooner than the old
+        // one-second window. The 250 ms cadence plus the longer gate
+        // hangover keeps the enrolled voice continuous through a single
+        // weak phoneme while still converging quickly on an impostor.
+        sv_window_samples: 12_000,
+        sv_update_samples: 4_000,
+        score_ema_alpha: 0.90,
         sv_min_new_samples_after_silence: 1_600,
         // Never adapt a biometric reference from live Discord audio:
         // a sustained friend could otherwise drift the target profile.
@@ -770,6 +826,9 @@ impl AppState {
             }
             pipeline_cfg.tse = Some(TseStageConfig::new_prod_48k(onnx.clone()));
         }
+        let gate_tuning = sepformer_onnx_path
+            .is_none()
+            .then(|| self.gate_tuning.clone());
         let cfg = SessionConfig {
             input_device: self.selected_input.clone(),
             output_device: self.selected_output.clone(),
@@ -794,6 +853,14 @@ impl AppState {
                 // on `SessionConfig` below — keep `None` here as the
                 // construction-time default.
                 dfn3_onnx_path: None,
+                // During overlap, TSE is already the target-speaker
+                // classifier. Do not let a louder raw mixture mute the
+                // correctly extracted enrolled speaker, and never mix
+                // the raw friend's voice back into the result.
+                overlap_bypass_speaker_gate: true,
+                overlap_wet_dry_alpha: 1.0,
+                overlap_hold_on_ms: 250.0,
+                overlap_hold_off_ms: 1_250.0,
                 ..Default::default()
             },
             dfn3_onnx_path,
@@ -802,6 +869,7 @@ impl AppState {
             speaker_embedding_onnx_path,
             speaker_selection_pool: self.separator_pool.clone(),
             separator_tuning: Some(self.separator_tuning.clone()),
+            gate_tuning,
             // GUI uses the safe default; multi-channel mic users
             // who want a specific channel use the CLI's
             // `mellonella live --input-channel N` for now. A GUI
@@ -848,6 +916,36 @@ impl AppState {
         let _ = std::fs::write(&path, format!("{:.3}\n", self.separator_tuning.threshold()));
     }
 
+    /// Persist the live gate controls. The in-memory values have
+    /// already reached the worker through atomics; this write only makes
+    /// them survive the next launch.
+    pub fn save_gate_settings(&mut self) {
+        self.gate_cfg.theta_pass = self.gate_tuning.threshold();
+        self.gate_cfg.hangover_ms = self.gate_tuning.hangover_ms();
+        self.gate_cfg.release_ms = self.gate_tuning.release_ms();
+        let Some(path) = gate_settings_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(
+            path,
+            format!(
+                "{:.3} {:.0} {:.0}\n",
+                self.gate_cfg.theta_pass, self.gate_cfg.hangover_ms, self.gate_cfg.release_ms,
+            ),
+        );
+    }
+
+    /// Apply one coherent live preset, then persist it.
+    pub fn set_gate_preset(&mut self, threshold: f32, hangover_ms: f32, release_ms: f32) {
+        self.gate_tuning.set_threshold(threshold);
+        self.gate_tuning.set_hangover_ms(hangover_ms);
+        self.gate_tuning.set_release_ms(release_ms);
+        self.save_gate_settings();
+    }
+
     /// Poll the live session for stats + events. Call once per UI
     /// frame so the displayed counters stay fresh and worker-side
     /// errors propagate into `last_error`.
@@ -892,6 +990,7 @@ impl AppState {
     /// Whether the strong language-independent two-speaker separation
     /// model is active for the next live session.
     #[must_use]
+    #[allow(clippy::unused_self)]
     pub fn sepformer_available(&self) -> bool {
         sepformer_path_from_env().is_some()
     }

@@ -381,10 +381,9 @@ impl MellonellaApp {
 
     /// Step 19: collapsible "Settings" section with sliders for
     /// the user-tunable gate / envelope / refresh-cadence
-    /// parameters. Disabled while a session is running — the
-    /// streaming pipeline reads the config at `LiveSession::new`,
-    /// not per-frame, so mid-stream changes wouldn't take effect
-    /// until Stop / Start anyway.
+    /// parameters. Gate controls are lock-free and update during a
+    /// running session; model-path changes still take effect on the
+    /// next start because they rebuild ONNX sessions.
     fn render_settings_panel(&mut self, ui: &mut egui::Ui) {
         let running = self.state.is_running();
         egui::CollapsingHeader::new("詳細設定")
@@ -394,104 +393,156 @@ impl MellonellaApp {
                     ui.weak("モデルの変更は次回フィルター開始時に反映されます。");
                 }
                 if self.state.sepformer_available() {
-                    ui.separator();
-                    ui.label(egui::RichText::new("本人判定のしきい値（強力2話者分離）").strong());
-                    let mut threshold = self.state.separator_tuning.threshold();
-                    let response = ui.add(
-                        egui::Slider::new(&mut threshold, 0.20..=0.80)
-                            .step_by(0.01)
-                            .text("しきい値"),
-                    );
-                    if response.changed() {
-                        self.state.separator_tuning.set_threshold(threshold);
-                        self.state.save_separator_threshold();
-                    }
-                    let last_score = self.state.separator_tuning.last_best_score();
-                    if running && last_score > 0.0 {
-                        let passing = last_score >= threshold;
-                        ui.colored_label(
-                            if passing {
-                                egui::Color32::from_rgb(80, 200, 120)
-                            } else {
-                                egui::Color32::from_rgb(160, 80, 80)
-                            },
-                            format!(
-                                "直近1秒の本人スコア: {last_score:.2}（{}）",
-                                if passing { "通過" } else { "抑制" }
-                            ),
-                        );
-                    } else {
-                        ui.weak("フィルター実行中は直近1秒の本人スコアがここに表示されます。");
-                    }
-                    ui.weak(
-                        "スコアがしきい値を下回った1秒間は無音になります。「抑制中」が続く場合は、\
-                         一人で話しながら上のスコアを確認し、その少し下（例: スコアが0.45前後なら0.40）\
-                         まで下げてください。下げるほど他人の声も通りやすくなります。変更は即時反映されます。",
-                    );
+                    self.render_separator_controls(ui, running);
                 } else {
-                    ui.separator();
-                    ui.label(egui::RichText::new("本人判定のしきい値").strong());
-                    let response = ui.add_enabled(
-                        !running,
-                        egui::Slider::new(&mut self.state.gate_cfg.theta_pass, 0.20..=0.60)
-                            .step_by(0.01)
-                            .text("しきい値"),
-                    );
-                    if response.changed() {
-                        self.state.gate_cfg.adaptive_theta = false;
-                    }
-                    ui.weak(
-                        "標準は0.30です。本人の声が途切れる場合は0.25前後まで下げ、\
-                         他人の声が漏れる場合は少し上げてください。変更は次回開始時に反映されます。",
-                    );
+                    self.render_gate_controls(ui, running);
                 }
-                {
-                    ui.separator();
-                    ui.label(egui::RichText::new("本人音声の抽出モデル").strong());
-                    ui.horizontal(|ui| {
-                        let label = self.state.tse_onnx_path.as_deref().map_or_else(
-                            || "(未選択)".to_string(),
-                            |p| {
-                                p.file_name().map_or_else(
-                                    || p.display().to_string(),
-                                    |n| n.to_string_lossy().into_owned(),
-                                )
-                            },
-                        );
-                        if ui.button("モデルを選択…").clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("ONNX model", &["onnx"])
-                                .pick_file()
-                            {
-                                self.state.tse_onnx_path = Some(path);
-                            }
-                        }
-                        if ui
-                            .button("モデルをダウンロード")
-                            .on_hover_text(
-                                "Fetch penta2himajin/tse-conv-tasnet-48k from \
-                                 huggingface.co into the local cache and use it. \
-                                 Subsequent runs reuse the cached file.",
-                            )
-                            .clicked()
-                        {
-                            self.state.fetch_tse_from_hf();
-                        }
-                        ui.label(label);
-                        if self.state.tse_onnx_path.is_some() && ui.small_button("解除").clicked()
-                        {
-                            self.state.tse_onnx_path = None;
-                        }
-                    });
-                    ui.label(
-                        egui::RichText::new(
-                            "Download from huggingface.co/penta2himajin/tse-conv-tasnet-48k",
-                        )
-                        .small()
-                        .color(egui::Color32::GRAY),
-                    );
-                }
+                self.render_tse_model_controls(ui);
             });
+    }
+
+    fn render_separator_controls(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.separator();
+        ui.label(egui::RichText::new("本人判定のしきい値（強力2話者分離）").strong());
+        let mut threshold = self.state.separator_tuning.threshold();
+        if ui
+            .add(
+                egui::Slider::new(&mut threshold, 0.20..=0.80)
+                    .step_by(0.01)
+                    .text("しきい値"),
+            )
+            .changed()
+        {
+            self.state.separator_tuning.set_threshold(threshold);
+            self.state.save_separator_threshold();
+        }
+        let last_score = self.state.separator_tuning.last_best_score();
+        if running && last_score > 0.0 {
+            let passing = last_score >= threshold;
+            ui.colored_label(
+                if passing {
+                    egui::Color32::from_rgb(80, 200, 120)
+                } else {
+                    egui::Color32::from_rgb(160, 80, 80)
+                },
+                format!(
+                    "直近1秒の本人スコア: {last_score:.2}（{}）",
+                    if passing { "通過" } else { "抑制" }
+                ),
+            );
+        } else {
+            ui.weak("フィルター実行中は直近1秒の本人スコアがここに表示されます。");
+        }
+        ui.weak(
+            "一人で話しながらスコアを確認し、その少し下まで下げてください。\
+             下げるほど他人の声も通りやすくなります。変更は即時反映されます。",
+        );
+    }
+
+    fn render_gate_controls(&mut self, ui: &mut egui::Ui, running: bool) {
+        ui.separator();
+        ui.label(egui::RichText::new("本人判定のしきい値").strong());
+        let mut threshold = self.state.gate_tuning.threshold();
+        let mut hangover_ms = self.state.gate_tuning.hangover_ms();
+        let mut release_ms = self.state.gate_tuning.release_ms();
+        let changed = ui
+            .add(
+                egui::Slider::new(&mut threshold, 0.15..=0.85)
+                    .step_by(0.01)
+                    .text("厳しさ"),
+            )
+            .changed()
+            | ui.add(
+                egui::Slider::new(&mut hangover_ms, 100.0..=1_200.0)
+                    .step_by(25.0)
+                    .suffix(" ms")
+                    .text("途切れ保護"),
+            )
+            .changed()
+            | ui.add(
+                egui::Slider::new(&mut release_ms, 30.0..=400.0)
+                    .step_by(10.0)
+                    .suffix(" ms")
+                    .text("閉じ方"),
+            )
+            .changed();
+        if changed {
+            self.state.gate_tuning.set_threshold(threshold);
+            self.state.gate_tuning.set_hangover_ms(hangover_ms);
+            self.state.gate_tuning.set_release_ms(release_ms);
+            self.state.save_gate_settings();
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("プリセット:");
+            if ui.small_button("途切れにくい").clicked() {
+                self.state.set_gate_preset(0.36, 700.0, 180.0);
+            }
+            if ui.small_button("標準").clicked() {
+                self.state.set_gate_preset(0.45, 500.0, 120.0);
+            }
+            if ui.small_button("他人を厳しく").clicked() {
+                self.state.set_gate_preset(0.58, 300.0, 80.0);
+            }
+        });
+        self.render_gate_score(ui, running);
+        ui.weak(
+            "変更は実行中でも即時反映・自動保存されます。本人まで抑制される場合は厳しさを\
+             0.03ずつ下げるか途切れ保護を伸ばし、友達が通る場合は厳しさを0.03ずつ上げます。\
+             二人同時に話す区間は別の本人抽出モデルが自動処理します。",
+        );
+    }
+
+    fn render_gate_score(&self, ui: &mut egui::Ui, running: bool) {
+        let last_score = self.state.gate_tuning.last_score();
+        if running && last_score != 0.0 {
+            let effective = self.state.gate_tuning.effective_threshold();
+            let passing = last_score >= effective;
+            ui.colored_label(
+                if passing {
+                    egui::Color32::from_rgb(80, 200, 120)
+                } else {
+                    egui::Color32::from_rgb(220, 120, 80)
+                },
+                format!(
+                    "現在の本人スコア: {last_score:.2} / しきい値 {effective:.2}（{}）",
+                    if passing { "通過" } else { "抑制" }
+                ),
+            );
+        } else if running {
+            ui.weak("本人スコアを測定中です（発話開始から約0.75秒）。");
+        }
+    }
+
+    fn render_tse_model_controls(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(egui::RichText::new("本人音声の抽出モデル").strong());
+        ui.horizontal(|ui| {
+            let label = self.state.tse_onnx_path.as_deref().map_or_else(
+                || "(未選択)".to_string(),
+                |p| {
+                    p.file_name().map_or_else(
+                        || p.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    )
+                },
+            );
+            if ui.button("モデルを選択…").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("ONNX model", &["onnx"])
+                    .pick_file()
+                {
+                    self.state.tse_onnx_path = Some(path);
+                }
+            }
+            if ui.button("モデルをダウンロード").clicked() {
+                self.state.fetch_tse_from_hf();
+            }
+            ui.label(label);
+            if self.state.tse_onnx_path.is_some() && ui.small_button("解除").clicked() {
+                self.state.tse_onnx_path = None;
+            }
+        });
     }
 
     fn render_error_row(&self, ui: &mut egui::Ui) {

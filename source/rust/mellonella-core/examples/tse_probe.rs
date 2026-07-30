@@ -1,3 +1,5 @@
+#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+
 use std::path::PathBuf;
 
 use mellonella_core::resample::resample_to;

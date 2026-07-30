@@ -645,6 +645,7 @@ fn cmd_live(args: LiveArgs) -> Result<(), CliError> {
         speaker_embedding_onnx_path: None,
         speaker_selection_pool: None,
         separator_tuning: None,
+        gate_tuning: None,
         input_channel: args.input_channel.into(),
     };
 

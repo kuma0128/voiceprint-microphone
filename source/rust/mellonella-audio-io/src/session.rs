@@ -14,6 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Sample, SampleFormat, Stream, StreamConfig};
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use mellonella_core::enrollment::EmbeddingPool;
+use mellonella_core::gating::GateConfig;
 use mellonella_core::pipeline::PipelineComponents;
 use mellonella_core::streaming::{StreamingConfig, StreamingPipeline};
 
@@ -31,6 +32,93 @@ const INPUT_RING_CHUNKS: usize = 64;
 /// It therefore needs only a small slot count; the cpal callback keeps
 /// the remaining samples in its local carry buffer.
 const OUTPUT_RING_CHUNKS: usize = 6;
+
+/// Lock-free gate controls and diagnostics shared by the GUI and audio
+/// worker. The worker snapshots these immediately before each pipeline
+/// push, so changes take effect during an active call without rebuilding
+/// model sessions or interrupting the stream.
+#[derive(Debug)]
+pub struct GateTuning {
+    threshold: AtomicU32,
+    hangover_ms: AtomicU32,
+    release_ms: AtomicU32,
+    last_score: AtomicU32,
+    effective_threshold: AtomicU32,
+}
+
+impl GateTuning {
+    #[must_use]
+    pub fn new(config: GateConfig) -> Self {
+        Self {
+            threshold: AtomicU32::new(config.theta_pass.to_bits()),
+            hangover_ms: AtomicU32::new(config.hangover_ms.to_bits()),
+            release_ms: AtomicU32::new(config.release_ms.to_bits()),
+            last_score: AtomicU32::new(0.0_f32.to_bits()),
+            effective_threshold: AtomicU32::new(config.theta_pass.to_bits()),
+        }
+    }
+
+    #[must_use]
+    pub fn threshold(&self) -> f32 {
+        f32::from_bits(self.threshold.load(Ordering::Relaxed))
+    }
+
+    pub fn set_threshold(&self, value: f32) {
+        if value.is_finite() {
+            self.threshold
+                .store(value.clamp(0.05, 0.95).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn hangover_ms(&self) -> f32 {
+        f32::from_bits(self.hangover_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_hangover_ms(&self, value: f32) {
+        if value.is_finite() {
+            self.hangover_ms
+                .store(value.clamp(0.0, 2_000.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn release_ms(&self) -> f32 {
+        f32::from_bits(self.release_ms.load(Ordering::Relaxed))
+    }
+
+    pub fn set_release_ms(&self, value: f32) {
+        if value.is_finite() {
+            self.release_ms
+                .store(value.clamp(0.0, 1_000.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    #[must_use]
+    pub fn last_score(&self) -> f32 {
+        f32::from_bits(self.last_score.load(Ordering::Relaxed))
+    }
+
+    #[must_use]
+    pub fn effective_threshold(&self) -> f32 {
+        f32::from_bits(self.effective_threshold.load(Ordering::Relaxed))
+    }
+
+    fn apply_to(&self, mut config: GateConfig) -> GateConfig {
+        config.theta_pass = self.threshold();
+        config.hangover_ms = self.hangover_ms();
+        config.release_ms = self.release_ms();
+        // A manual threshold must stay exact and predictable.
+        config.adaptive_theta = false;
+        config
+    }
+
+    fn update_diagnostics(&self, score: f32, effective_threshold: f32) {
+        self.last_score.store(score.to_bits(), Ordering::Relaxed);
+        self.effective_threshold
+            .store(effective_threshold.to_bits(), Ordering::Relaxed);
+    }
+}
 
 /// Caller-tunable knobs for [`LiveSession::new`].
 ///
@@ -82,6 +170,9 @@ pub struct SessionConfig {
     /// uses private defaults and the threshold is fixed for its
     /// lifetime.
     pub separator_tuning: Option<Arc<SeparatorTuning>>,
+    /// Live speaker-gate controls and score readout shared with the UI.
+    /// `None` keeps the values in [`Self::streaming`] fixed.
+    pub gate_tuning: Option<Arc<GateTuning>>,
     /// How to fold a multi-channel input device's interleaved
     /// frames down to mono. Default `Average` — same as step 12's
     /// hard-coded behaviour. Use `Channel(n)` to pick a specific
@@ -282,6 +373,9 @@ impl LiveSession {
                 ));
             }
         };
+        if let Some(tuning) = config.gate_tuning.as_deref() {
+            tuning.update_diagnostics(0.0, tuning.threshold());
+        }
         let pipeline = StreamingPipeline::new(pool, streaming_cfg, components)
             .map_err(|e| AudioIoError::Pipeline(e.to_string()))?;
         if dfn3_enabled {
@@ -291,6 +385,7 @@ impl LiveSession {
         let worker = spawn_worker(
             pipeline,
             separator,
+            config.gate_tuning,
             input_rx,
             output_tx,
             events_tx,
@@ -407,6 +502,7 @@ impl Drop for LiveSession {
 fn spawn_worker(
     mut pipeline: StreamingPipeline,
     mut separator: Option<TargetSpeakerSeparator>,
+    gate_tuning: Option<Arc<GateTuning>>,
     input_rx: Receiver<Vec<f32>>,
     output_tx: Sender<Vec<f32>>,
     events_tx: Sender<SessionEvent>,
@@ -478,6 +574,7 @@ fn spawn_worker(
                         &mut first_nonempty_output_logged,
                         &mut first_producer_drop_logged,
                         &mut producer_drops,
+                        gate_tuning.as_deref(),
                     ) {
                         Ok(true) => {}
                         Ok(false) => return,
@@ -525,6 +622,7 @@ fn spawn_worker(
                             &mut first_nonempty_output_logged,
                             &mut first_producer_drop_logged,
                             &mut producer_drops,
+                            gate_tuning.as_deref(),
                         );
                     }
                     Ok(None) => {}
@@ -559,8 +657,18 @@ fn forward_pipeline_audio(
     first_nonempty_output_logged: &mut bool,
     first_producer_drop_logged: &mut bool,
     producer_drops: &mut u64,
+    gate_tuning: Option<&GateTuning>,
 ) -> Result<bool, String> {
+    if let Some(tuning) = gate_tuning {
+        // Preserve non-UI gate fields (attack, scoring mode, learning
+        // guards) and replace only the controls surfaced to the user.
+        let gate = tuning.apply_to(pipeline.gate_config());
+        pipeline.set_gate_config(gate);
+    }
     let out = pipeline.push_samples(audio).map_err(|e| e.to_string())?;
+    if let Some(tuning) = gate_tuning {
+        tuning.update_diagnostics(pipeline.last_score(), pipeline.effective_gate_threshold());
+    }
     if let Some(&(_, is_on)) = out.gate_decisions.last() {
         gate_on.store(is_on, Ordering::Relaxed);
     }
@@ -789,4 +897,47 @@ fn build_output_stream(
             None,
         )
         .map_err(|e| AudioIoError::Stream(e.to_string()))
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_tuning_updates_only_exposed_fields() {
+        let base = GateConfig {
+            theta_pass: 0.30,
+            hangover_ms: 200.0,
+            release_ms: 80.0,
+            attack_ms: 27.0,
+            theta_f0: 0.61,
+            adaptive_theta: true,
+            ..GateConfig::default()
+        };
+        let tuning = GateTuning::new(base);
+        tuning.set_threshold(0.57);
+        tuning.set_hangover_ms(625.0);
+        tuning.set_release_ms(170.0);
+        let changed = tuning.apply_to(base);
+        assert_eq!(changed.theta_pass, 0.57);
+        assert_eq!(changed.hangover_ms, 625.0);
+        assert_eq!(changed.release_ms, 170.0);
+        assert_eq!(changed.attack_ms, 27.0);
+        assert_eq!(changed.theta_f0, 0.61);
+        assert!(!changed.adaptive_theta);
+    }
+
+    #[test]
+    fn gate_tuning_rejects_non_finite_and_clamps_extremes() {
+        let tuning = GateTuning::new(GateConfig::default());
+        tuning.set_threshold(f32::NAN);
+        assert_eq!(tuning.threshold(), GateConfig::default().theta_pass);
+        tuning.set_threshold(5.0);
+        tuning.set_hangover_ms(-10.0);
+        tuning.set_release_ms(5_000.0);
+        assert_eq!(tuning.threshold(), 0.95);
+        assert_eq!(tuning.hangover_ms(), 0.0);
+        assert_eq!(tuning.release_ms(), 1_000.0);
+    }
 }
