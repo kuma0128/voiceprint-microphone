@@ -86,27 +86,29 @@ fn synth_waveform(sample_rate: u32, duration_sec: f32, f0: f32) -> Vec<f32> {
 
 /// Locate the repo root by walking up from `CARGO_MANIFEST_DIR`. Same
 /// pattern as `tests/tse_parity.rs`.
-fn repo_root() -> PathBuf {
+fn repo_root() -> Option<PathBuf> {
     let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for _ in 0..4 {
         if here.join("scripts/export_tse_onnx.py").exists() {
-            return here;
+            return Some(here);
         }
         if !here.pop() {
             break;
         }
     }
-    panic!(
-        "cannot locate repo root from CARGO_MANIFEST_DIR={CARGO_MANIFEST_DIR}",
-        CARGO_MANIFEST_DIR = env!("CARGO_MANIFEST_DIR")
+    eprintln!(
+        "[skip] packaged source has no scripts/export_tse_onnx.py under \
+         CARGO_MANIFEST_DIR={}",
+        env!("CARGO_MANIFEST_DIR")
     );
+    None
 }
 
 /// Build / reuse the smoke TSE ONNX. Returns `Some(path)` when the
 /// fixture is ready, `None` when Python / torch isn't available and
 /// the caller should skip the test.
 fn ensure_tse_smoke_onnx() -> Option<PathBuf> {
-    let root = repo_root();
+    let root = repo_root()?;
     let build = root.join("build");
     let onnx_path = build.join("tse_smoke.onnx");
     let weights_path = build.join("tse_smoke.onnx.weights.pt");

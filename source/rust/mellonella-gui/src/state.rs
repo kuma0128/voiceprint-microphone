@@ -292,40 +292,64 @@ fn preferred_device_from_env(env_var: &str, devices: &[AudioDevice]) -> Option<S
 /// Default on-disk location for the auto-saved enrollment:
 /// `<dirs::config_dir>/mellonella/enrollment.json`. Returns `None` on
 /// platforms where `dirs::config_dir()` is unavailable (rare).
+fn mellonella_config_dir() -> Option<PathBuf> {
+    #[cfg(not(test))]
+    {
+        Some(dirs::config_dir()?.join("mellonella"))
+    }
+    #[cfg(test)]
+    {
+        // Tests that exercise auto-loading must never rename or delete the
+        // user's real biometric profile. A thread-local directory also keeps
+        // concurrently-running tests from racing over one shared fixture.
+        thread_local! {
+            static TEST_CONFIG_DIR: PathBuf = std::env::temp_dir().join(format!(
+                "mellonella-tests-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )).join("mellonella");
+        }
+        TEST_CONFIG_DIR.with(Clone::clone).into()
+    }
+}
+
 #[must_use]
 pub fn default_enrollment_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("enrollment.json"))
+    Some(mellonella_config_dir()?.join("enrollment.json"))
 }
 
 /// Companion profile used only to identify SepFormer's anonymous
 /// output streams.
 #[must_use]
 pub fn default_separator_enrollment_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("enrollment-separator.json"))
+    Some(mellonella_config_dir()?.join("enrollment-separator.json"))
 }
 
 /// On-disk location of the persisted separator fail-closed threshold —
 /// a single plain-text float next to the enrollment JSON.
 #[must_use]
 pub fn separator_threshold_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("separator-threshold.txt"))
+    Some(mellonella_config_dir()?.join("separator-threshold.txt"))
 }
-
-/// Leading token of [`gate_settings_path`]. Bumped whenever the meaning
-/// of the stored numbers changes, so a file from an older build is
-/// discarded rather than misread.
-const GATE_SETTINGS_FORMAT: &str = "v2";
 
 /// Persisted live gate controls. A small text format keeps this
 /// backward-compatible and lets a damaged file fall back atomically to
 /// safe defaults: `v2 <threshold> <hangover_ms> <release_ms>`.
+///
+/// `v2` identifies settings calibrated for max-over-reference identity
+/// scoring. Older thresholds are accepted only after clamping them to the
+/// current safe default; stricter user settings remain intact.
+const GATE_SETTINGS_FORMAT: &str = "v2";
+
 #[must_use]
 pub fn gate_settings_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("gate-settings.txt"))
+    Some(mellonella_config_dir()?.join("gate-settings.txt"))
+}
+
+/// Threshold file written by packaged builds before the live gate UI
+/// started persisting all three controls together.
+fn legacy_voiceprint_threshold_path() -> Option<PathBuf> {
+    Some(mellonella_config_dir()?.join("voiceprint-threshold.txt"))
 }
 
 fn default_gate_config() -> GateConfig {
@@ -340,31 +364,48 @@ fn default_gate_config() -> GateConfig {
 
 fn load_gate_config() -> GateConfig {
     let mut config = default_gate_config();
-    let Some(text) = gate_settings_path().and_then(|path| std::fs::read_to_string(path).ok())
-    else {
-        return config;
-    };
-    let mut tokens = text.split_whitespace();
-    // Reject files written before the identity-scoring fix. Their
-    // threshold was hand-tuned against a score scale where the enrolled
-    // speaker's own score sat unnaturally low; carrying that number
-    // forward onto the corrected scale would leave the gate wide open to
-    // other voices. Falling back to the default is the safe direction.
-    if tokens.next() != Some(GATE_SETTINGS_FORMAT) {
-        return config;
-    }
-    let values: Vec<f32> = tokens
-        .filter_map(|part| part.parse::<f32>().ok())
-        .collect();
-    if let [threshold, hangover_ms, release_ms, ..] = values.as_slice() {
-        if (0.15..=0.85).contains(threshold)
-            && (100.0..=1_200.0).contains(hangover_ms)
-            && (30.0..=400.0).contains(release_ms)
-        {
-            config.theta_pass = *threshold;
-            config.hangover_ms = *hangover_ms;
-            config.release_ms = *release_ms;
+    if let Some(text) = gate_settings_path().and_then(|path| std::fs::read_to_string(path).ok()) {
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        let versioned = tokens.first().copied() == Some(GATE_SETTINGS_FORMAT);
+        // A future version must fail closed instead of being interpreted as
+        // today's three-number layout. Unversioned files are the v1 layout.
+        let unknown_version = tokens
+            .first()
+            .is_some_and(|token| token.starts_with('v') && !versioned);
+        let value_tokens = if versioned { &tokens[1..] } else { &tokens[..] };
+        let values: Vec<f32> = value_tokens
+            .iter()
+            .filter_map(|part| part.parse::<f32>().ok())
+            .collect();
+        if !unknown_version {
+            if let [threshold, hangover_ms, release_ms, ..] = values.as_slice() {
+                if (0.15..=0.85).contains(threshold)
+                    && (100.0..=1_200.0).contains(hangover_ms)
+                    && (30.0..=400.0).contains(release_ms)
+                {
+                    config.theta_pass = if versioned {
+                        *threshold
+                    } else {
+                        threshold.max(DEFAULT_GATE_THRESHOLD)
+                    };
+                    config.hangover_ms = *hangover_ms;
+                    config.release_ms = *release_ms;
+                    return config;
+                }
+            }
         }
+    }
+
+    // The oldest builds stored only the threshold. Max-over-reference
+    // scoring raises genuine and impostor scores relative to the old
+    // centroid-only scale, so never migrate a value below today's safe
+    // default. A stricter personal value remains useful and is preserved.
+    if let Some(threshold) = legacy_voiceprint_threshold_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<f32>().ok())
+        .filter(|value| (0.15..=0.85).contains(value))
+    {
+        config.theta_pass = threshold.max(DEFAULT_GATE_THRESHOLD);
     }
     config
 }
@@ -388,22 +429,15 @@ fn load_separator_threshold() -> f32 {
 /// * `silence_force_off_ms = 700` — ignore ordinary inter-word pauses
 ///   while still preventing an old score from holding the gate open
 ///   indefinitely in an empty room.
-/// * `sv_window_samples = 16_000`, `sv_update_samples = 4_000` — a 1 s
-///   identity window refreshed every 250 ms. The window length is not a
-///   free responsiveness knob: ECAPA cosine similarity falls off sharply
-///   as the window shrinks, and on this project's fixtures the enrolled
-///   speaker scores ≈ 0.52 at 1 s but only 0.16-0.26 at 0.5 s — the same
-///   range an unrelated speaker occupies. The 750 ms window shipped
-///   earlier sat on that slope, which put the enrolled speaker's own
-///   score near the 0.45 gate threshold and got them suppressed
-///   mid-sentence. The 250 ms refresh cadence (unchanged) is what keeps
-///   the response to a speaker change quick.
-/// * `async_refresh = true` — run Fbank / ECAPA / F0 on a worker thread
-///   instead of inline. Inline, each refresh blocked the audio thread
-///   for tens of ms four times a second, which starved the output
-///   device and chopped the audio.
+/// * `sv_window_samples = 16_000`, `sv_update_samples = 4_000` — use a
+///   one-second identity window refreshed every 250 ms. The longer window
+///   restores ECAPA score margin; the refresh cadence, not the window
+///   length, controls how quickly a changed speaker is noticed.
 /// * `score_ema_alpha = 0.9` — react quickly to the newer speaker
 ///   embedding; gate hangover handles isolated target-score dips.
+/// * `async_refresh = true` — ECAPA/Fbank runs off the audio worker so
+///   its periodic inference cannot starve the output callback and turn
+///   otherwise clean speech into regular gaps.
 /// * `sv_min_new_samples_after_silence = 1600` — fire the
 ///   post-silence early refresh after only 100 ms of new speech
 ///   (instead of the library-default 250 ms) so `last_score` catches
@@ -416,15 +450,12 @@ pub fn default_live_pipeline_cfg() -> PipelineConfig {
         // hangover still rejects a changed speaker; this rule exists
         // only to prevent a stale gate from remaining open in silence.
         silence_force_off_ms: 700.0,
-        // One second is the shortest window at which ECAPA still
-        // separates the enrolled speaker from a stranger; see the doc
-        // comment above. Responsiveness comes from the 250 ms refresh
-        // cadence, not from shortening this.
+        // One second is the shortest measured window that keeps the
+        // enrolled speaker comfortably separated from an impostor.
         sv_window_samples: 16_000,
         sv_update_samples: 4_000,
-        // Keep the model inference off the realtime audio thread.
-        async_refresh: true,
         score_ema_alpha: 0.90,
+        async_refresh: true,
         sv_min_new_samples_after_silence: 1_600,
         // Never adapt a biometric reference from live Discord audio:
         // a sustained friend could otherwise drift the target profile.
@@ -884,12 +915,9 @@ impl AppState {
                 // the raw friend's voice back into the result.
                 overlap_bypass_speaker_gate: true,
                 overlap_wet_dry_alpha: 1.0,
-                // Require three consecutive detector decisions, not one.
-                // The detector runs every 250 ms, so the old 250 ms hold
-                // meant a single decision flipped the chain — and every
-                // flip swaps which neural stage is running, from a cold
-                // state. Real conversation crosses the overlap threshold
-                // constantly, so the chain flapped continuously.
+                // Require three consecutive detector decisions. One
+                // 250 ms decision made normal conversation flap between
+                // cold DFN3 and TSE states and repeatedly cut the tail.
                 overlap_hold_on_ms: 750.0,
                 overlap_hold_off_ms: 1_250.0,
                 ..Default::default()
@@ -1094,54 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_window_is_at_least_one_second() {
-        // Measured on the `test-audio` fixtures, dropping to a 750 ms
-        // window costs the enrolled speaker 0.13 of score (5th-percentile
-        // 0.643 → 0.518) while barely moving an unrelated speaker —
-        // enough to put the enrolled speaker's own voice at the 0.45 gate
-        // threshold and get them cut off mid-sentence.
-        assert!(
-            default_live_pipeline_cfg().sv_window_samples >= DECISION_SAMPLE_RATE as usize,
-            "shortening the identity window below 1 s suppresses the enrolled speaker"
-        );
-    }
-
-    #[test]
-    fn live_pipeline_keeps_inference_off_the_audio_thread() {
-        let cfg = default_live_pipeline_cfg();
-        assert!(
-            cfg.async_refresh,
-            "inline Fbank/ECAPA/F0 starves the output device four times a second"
-        );
-        assert!(!cfg.enable_auto_learn, "never adapt from live call audio");
-    }
-
-    #[test]
-    fn unversioned_gate_settings_fall_back_to_defaults() {
-        // A threshold hand-tuned against the pre-fix score scale must not
-        // survive into a build where the enrolled speaker scores higher —
-        // it would leave the gate open to other voices.
-        let dir = std::env::temp_dir().join("mellonella-gate-settings-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let legacy = dir.join("legacy.txt");
-        std::fs::write(&legacy, "0.180 500 120\n").expect("write legacy settings");
-        let text = std::fs::read_to_string(&legacy).expect("read back");
-        let mut tokens = text.split_whitespace();
-        assert_ne!(
-            tokens.next(),
-            Some(GATE_SETTINGS_FORMAT),
-            "legacy files carry no version token, so the loader rejects them"
-        );
-        // The current writer emits one, so round-tripping is accepted.
-        let current = format!("{GATE_SETTINGS_FORMAT} 0.500 600 150\n");
-        let mut tokens = current.split_whitespace();
-        assert_eq!(tokens.next(), Some(GATE_SETTINGS_FORMAT));
-        let values: Vec<f32> = tokens.filter_map(|p| p.parse::<f32>().ok()).collect();
-        assert_eq!(values.len(), 3);
-        let _ = std::fs::remove_file(&legacy);
-    }
-
-    #[test]
     fn refresh_devices_clears_invalid_selection() {
         let mut s = AppState {
             selected_input: Some("__not-a-real-device__".into()),
@@ -1157,6 +1137,20 @@ mod tests {
             OUTPUT_SAMPLE_RATE,
             mellonella_audio_io::INTERNAL_SAMPLE_RATE,
             "OUTPUT_SAMPLE_RATE must match mellonella-audio-io's INTERNAL_SAMPLE_RATE",
+        );
+    }
+
+    #[test]
+    fn live_identity_window_is_at_least_one_second() {
+        let config = default_live_pipeline_cfg();
+        assert!(config.sv_window_samples >= DECISION_SAMPLE_RATE as usize);
+        assert!(
+            config.async_refresh,
+            "live ECAPA must stay off the audio thread"
+        );
+        assert!(
+            !config.enable_auto_learn,
+            "never adapt from live call audio"
         );
     }
 
@@ -1178,9 +1172,8 @@ mod tests {
     // mellonella-core integration tests (`MELLONELLA_ECAPA_ONNX`,
     // `MELLONELLA_VAD_ONNX`, `ORT_DYLIB_PATH`) so a contributor without
     // the model artefacts still gets a green `cargo test`. The
-    // persistence helpers below stash and restore any pre-existing
-    // `default_enrollment_path()` file so they don't clobber a real
-    // profile.
+    // persistence helpers below use the thread-local test config root;
+    // they never open or rename a real biometric profile.
     // ----------------------------------------------------------------
 
     fn skip_if_no_onnx() -> Option<(String, String)> {
@@ -1348,9 +1341,14 @@ mod tests {
         };
 
         // 3) Build a StreamingConfig that mirrors the GUI's
-        //    `AppState::start()` exactly — same gate, same pipeline
-        //    cadence, TSE Prod48k enabled, DFN3 enabled.
+        //    `AppState::start()` — same gate, identity cadence, TSE
+        //    Prod48k, and DFN3. The deterministic parity fixture is a
+        //    synthetic ECAPA signal rather than ordinary speech, so it
+        //    only produces three Silero-positive frames. Force VAD on
+        //    here to exercise the live identity/async/gate path. VAD
+        //    model behavior itself has a separate parity test.
         let mut pipeline_cfg = default_live_pipeline_cfg();
+        pipeline_cfg.vad_threshold = -1.0;
         pipeline_cfg.tse = Some(TseStageConfig::new_prod_48k(PathBuf::from(&tse_path)));
         let cfg = StreamingConfig {
             pipeline: pipeline_cfg,
@@ -1377,6 +1375,7 @@ mod tests {
         let mut gate_on_samples = 0_u64;
         let mut chunks_pushed = 0_u64;
         let mut zero_output_chunks = 0_u64;
+        let mut max_live_score = 0.0_f32;
         let t0 = std::time::Instant::now();
         for chunk in audio_48k.chunks(chunk_size) {
             let out = pipeline
@@ -1403,8 +1402,17 @@ mod tests {
                 gate_on_samples += out.audio.len() as u64;
             }
             all_output.extend_from_slice(&out.audio);
+            max_live_score = max_live_score.max(pipeline.last_score());
+            // The live ECAPA worker runs concurrently with real 10 ms cpal
+            // callbacks. Feeding two seconds of audio in a tight loop lets
+            // the producer outrun inference and used to make this test pass
+            // with an entirely silent output. Preserve the live cadence so
+            // this exercises async result delivery and an actually open gate.
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let score_before_flush = pipeline.last_score();
         let tail = pipeline.flush().expect("flush");
+        let score_after_flush = pipeline.last_score();
         for &s in &tail.audio {
             if s.is_nan() {
                 nan_count += 1;
@@ -1434,6 +1442,10 @@ mod tests {
             "[offline] gate transitions: {gate_transitions}, samples gate-on / total: \
              {gate_on_samples} / {total_out}"
         );
+        eprintln!(
+            "[offline] speaker score max-live={max_live_score:.4}, \
+             before-flush={score_before_flush:.4}, after-flush={score_after_flush:.4}"
+        );
         eprintln!("[offline] RMS  in={rms_in:.4}  out={rms_out:.4}  ({rms_db:+.1} dB)");
         eprintln!("[offline] PEAK in={peak_in:.4}  out={peak_out:.4}  ({peak_db:+.1} dB)");
 
@@ -1456,6 +1468,14 @@ mod tests {
             len_delta <= slack,
             "output length {total_out} too far from input {total_in} \
              (delta {len_delta}, slack {slack})"
+        );
+        assert!(
+            gate_on_samples > u64::try_from(total_out).expect("audio length fits u64") / 10,
+            "enrolled speech never opened the live gate: {gate_on_samples} / {total_out} samples"
+        );
+        assert!(
+            rms_out > 1.0e-4,
+            "live pipeline emitted silence for enrolled speech (RMS {rms_out:.3e})"
         );
 
         // 6) Optional artefact dump for ear-checking the chain.
@@ -1563,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn start_records_an_error_when_no_audio_device_is_available() {
+    fn start_records_an_error_for_an_invalid_audio_device() {
         let Some((ecapa, vad)) = skip_if_no_onnx() else {
             return;
         };
@@ -1571,23 +1591,13 @@ mod tests {
         with_test_enrollment(&pool, || {
             let mut state = AppState::default();
             assert!(state.pool.is_some(), "precondition: pool auto-loaded");
+            // Never open the developer/user's real microphone from a unit
+            // test. An impossible explicit name deterministically exercises
+            // the same construction-error path on every machine.
+            state.selected_input = Some("__mellonella_test_missing_input__".to_string());
             state.start();
-            // Headless container has no cpal device → start() must
-            // surface an error and leave no half-constructed session.
-            // (If audio is somehow available, the session is fine —
-            // stop it to keep the test hermetic.)
-            let has_err = state.last_error.is_some();
-            let has_session = state.session.is_some();
-            assert!(
-                has_err ^ has_session,
-                "expected exactly one of last_error / session after start(); \
-                 err={:?}, has_session={has_session}",
-                state.last_error
-            );
-            if has_session {
-                state.stop();
-                assert!(state.session.is_none());
-            }
+            assert!(state.last_error.is_some());
+            assert!(state.session.is_none());
         });
     }
 
@@ -1600,6 +1610,55 @@ mod tests {
             })
             .collect();
         assert!(validate_enrollment_capture(&audio, OUTPUT_SAMPLE_RATE).is_ok());
+    }
+
+    #[test]
+    fn legacy_voiceprint_threshold_is_clamped_to_the_new_safe_scale() {
+        let legacy = legacy_voiceprint_threshold_path().expect("test config dir");
+        let current = gate_settings_path().expect("test config dir");
+        if let Some(parent) = legacy.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&current);
+        std::fs::write(&legacy, "0.398\n").unwrap();
+        let config = load_gate_config();
+        assert!((config.theta_pass - DEFAULT_GATE_THRESHOLD).abs() < f32::EPSILON);
+        assert!((config.hangover_ms - DEFAULT_GATE_HANGOVER_MS).abs() < f32::EPSILON);
+        assert!((config.release_ms - DEFAULT_GATE_RELEASE_MS).abs() < f32::EPSILON);
+        let _ = std::fs::remove_file(legacy);
+    }
+
+    #[test]
+    fn versioned_gate_settings_preserve_a_user_tuned_threshold() {
+        let legacy = legacy_voiceprint_threshold_path().expect("test config dir");
+        let current = gate_settings_path().expect("test config dir");
+        if let Some(parent) = current.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&legacy);
+        std::fs::write(&current, "v2 0.398 650 140\n").unwrap();
+        let config = load_gate_config();
+        assert!((config.theta_pass - 0.398).abs() < f32::EPSILON);
+        assert!((config.hangover_ms - 650.0).abs() < f32::EPSILON);
+        assert!((config.release_ms - 140.0).abs() < f32::EPSILON);
+        let _ = std::fs::remove_file(current);
+    }
+
+    #[test]
+    fn unversioned_gate_settings_keep_stricter_values_but_clamp_looser_ones() {
+        let legacy = legacy_voiceprint_threshold_path().expect("test config dir");
+        let current = gate_settings_path().expect("test config dir");
+        if let Some(parent) = current.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&legacy);
+
+        std::fs::write(&current, "0.600 650 140\n").unwrap();
+        assert!((load_gate_config().theta_pass - 0.600).abs() < f32::EPSILON);
+
+        std::fs::write(&current, "0.300 650 140\n").unwrap();
+        assert!((load_gate_config().theta_pass - DEFAULT_GATE_THRESHOLD).abs() < f32::EPSILON);
+        let _ = std::fs::remove_file(current);
     }
 
     #[test]

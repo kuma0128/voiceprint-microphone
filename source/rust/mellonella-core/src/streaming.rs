@@ -236,13 +236,12 @@ pub struct StreamingConfig {
     /// Default `0.0 dB` — Overlap path stays unaltered in this
     /// phase. Phase-2 work will wire RMS-matching here.
     pub makeup_gain_db_overlap: f32,
-    /// Post-makeup soft-saturation curve enable. When `true`, output
-    /// samples are passed through `tanh` before the envelope
-    /// multiply, so a peak that exceeds full-scale (because the
-    /// makeup gain pushed it there) saturates smoothly instead of
-    /// being clipped at the DAC. tanh is monotonic and adds
-    /// 3rd-harmonic distortion only when the magnitude is already
-    /// past ~0.5, so quiet audio is effectively unchanged.
+    /// Post-makeup transparent soft limiter enable. Samples at or below
+    /// 0.95 full scale pass through byte-for-byte; only the last 5 % of
+    /// headroom is bent smoothly toward ±1.0. This protects peaks pushed
+    /// over full scale by makeup gain without applying `tanh` compression
+    /// to ordinary speech (the old curve was already 7.6 % nonlinear at
+    /// 0.5 and was audible as a rough / overdriven voice).
     ///
     /// Default `true`. The soft-clip is cheap (~5 ns / sample on
     /// modern CPUs) and the audible artefact of a hard clip on a
@@ -497,6 +496,35 @@ fn db_to_lin(db: f32) -> f32 {
         1.0
     } else {
         10.0_f32.powf(db / 20.0)
+    }
+}
+
+/// Convert a live audio sample count for RMS/crossfade arithmetic.
+///
+/// Counts reaching this path are one VAD frame, one model tail, or one
+/// configured transition and are therefore far below f32's exact-integer
+/// range (2²⁴). Keeping the cast here makes that invariant explicit.
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+fn sample_count_as_f32(count: usize) -> f32 {
+    count as f32
+}
+
+/// Transparent soft limiter with a unity-gain region for normal speech.
+///
+/// `tanh(x)` across the whole waveform sounds compressed well before a
+/// sample is in danger of clipping. This splice keeps `f(x) = x` through
+/// ±0.95, then uses a value- and slope-continuous tanh knee that approaches
+/// ±1.0 asymptotically.
+#[inline]
+fn transparent_soft_limit(sample: f32) -> f32 {
+    const KNEE: f32 = 0.95;
+    const HEADROOM: f32 = 1.0 - KNEE;
+    let magnitude = sample.abs();
+    if magnitude <= KNEE {
+        sample
+    } else {
+        sample.signum() * (KNEE + HEADROOM * ((magnitude - KNEE) / HEADROOM).tanh())
     }
 }
 
@@ -2129,7 +2157,7 @@ impl StreamingState {
                 let static_lin = db_to_lin(config.makeup_gain_db_overlap);
                 let rms_match_lin = if config.overlap_rms_match {
                     let out_sum_sq: f32 = processed[..n_emit].iter().map(|s| s * s).sum();
-                    let out_rms = (out_sum_sq / n_emit as f32).sqrt();
+                    let out_rms = (out_sum_sq / sample_count_as_f32(n_emit)).sqrt();
                     // Pick the match target.
                     let target_rms =
                         if config.overlap_match_solo_loudness && self.solo_output_rms_ema > 1e-6 {
@@ -2141,7 +2169,7 @@ impl StreamingState {
                                 .take(n_emit)
                                 .map(|s| s * s)
                                 .sum();
-                            (in_sum_sq / n_emit as f32).sqrt()
+                            (in_sum_sq / sample_count_as_f32(n_emit)).sqrt()
                         };
                     let raw_ratio = target_rms.max(1e-9) / out_rms.max(1e-9);
                     let max_lin = db_to_lin(config.overlap_rms_match_max_gain_db);
@@ -2177,8 +2205,8 @@ impl StreamingState {
             // makeup) to 1.0 (fully settled into the new mode).
             let (makeup_lin, alpha) =
                 if self.chain_transition_remaining > 0 && self.chain_transition_total > 0 {
-                    let rem = self.chain_transition_remaining as f32;
-                    let tot = self.chain_transition_total as f32;
+                    let rem = sample_count_as_f32(self.chain_transition_remaining);
+                    let tot = sample_count_as_f32(self.chain_transition_total);
                     let weight = 1.0 - rem / tot;
                     self.chain_transition_remaining -= 1;
                     let blended_makeup = (1.0 - weight) * self.chain_transition_prev_makeup_lin
@@ -2197,7 +2225,7 @@ impl StreamingState {
                 chain_processed
             };
             let limited = if soft_clip_enabled {
-                mixed.tanh()
+                transparent_soft_limit(mixed)
             } else {
                 mixed
             };
@@ -2218,7 +2246,7 @@ impl StreamingState {
             }
         }
         if mode == ChainMode::Solo && solo_active_count > 0 {
-            let chunk_rms = (solo_active_sum_sq / solo_active_count as f32).sqrt();
+            let chunk_rms = (solo_active_sum_sq / sample_count_as_f32(solo_active_count)).sqrt();
             let a = config.solo_loudness_ema_alpha.clamp(0.0, 1.0);
             self.solo_output_rms_ema = if self.solo_output_rms_ema <= 1e-9 {
                 chunk_rms
@@ -3009,6 +3037,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transparent_limiter_is_exactly_linear_for_normal_speech() {
+        for sample in [-0.95_f32, -0.75, -0.5, -0.1, 0.0, 0.1, 0.5, 0.75, 0.95] {
+            assert_eq!(transparent_soft_limit(sample), sample);
+        }
+    }
+
+    #[test]
+    fn transparent_limiter_bounds_overload_without_a_hard_corner() {
+        for sample in [-100.0_f32, -2.0, -1.0, 1.0, 2.0, 100.0] {
+            let limited = transparent_soft_limit(sample);
+            assert!(limited.abs() <= 1.0, "{sample} became {limited}");
+            assert_eq!(limited.signum(), sample.signum());
+        }
+        let just_below = transparent_soft_limit(0.95 - 1.0e-4);
+        let just_above = transparent_soft_limit(0.95 + 1.0e-4);
+        assert!((just_above - just_below - 2.0e-4).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn overlap_bypass_uses_tse_vad_instead_of_raw_mixture_score() {
         assert!(final_gate_decision(
             true,
@@ -3101,8 +3148,12 @@ mod tests {
         cfg.chain_soft_clip = false;
         cfg.mode_transition_crossfade_samples = 0;
         let mut state = StreamingState::new(&cfg).expect("state");
-        state.chain_pending_gain.extend(std::iter::repeat(1.0).take(n));
-        state.chain_pending_raw.extend(std::iter::repeat(0.0).take(n));
+        state
+            .chain_pending_gain
+            .extend(std::iter::repeat(1.0).take(n));
+        state
+            .chain_pending_raw
+            .extend(std::iter::repeat(0.0).take(n));
         (state, cfg)
     }
 

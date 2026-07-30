@@ -264,7 +264,7 @@ impl EmbeddingPool {
             .map(|reference| cos_similarity(emb, reference))
             .fold(f32::NEG_INFINITY, f32::max);
         if best.is_finite() {
-            best
+            best.max(0.0)
         } else {
             0.0
         }
@@ -633,11 +633,17 @@ mod tests {
         );
     }
 
-
     #[test]
     fn match_score_zero_for_empty_pool() {
         let pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
         assert_eq!(pool.match_score(&[1.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn match_score_floors_negative_cosine_at_zero() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        pool.add_anchors([vec![1.0, 0.0, 0.0]]);
+        assert_eq!(pool.match_score(&[-1.0, 0.0, 0.0]), 0.0);
     }
 
     #[test]

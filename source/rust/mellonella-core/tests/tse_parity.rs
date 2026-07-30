@@ -48,20 +48,17 @@ const TOL: f32 = 1e-4;
 /// we find `scripts/export_tse_onnx.py`. The test is run with
 /// `CARGO_MANIFEST_DIR == rust/mellonella-core`, so the repo root sits
 /// two levels up.
-fn repo_root() -> PathBuf {
+fn repo_root() -> Option<PathBuf> {
     let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for _ in 0..4 {
         if here.join("scripts/export_tse_onnx.py").exists() {
-            return here;
+            return Some(here);
         }
         if !here.pop() {
             break;
         }
     }
-    panic!(
-        "cannot locate repo root from CARGO_MANIFEST_DIR={CARGO_MANIFEST_DIR}",
-        CARGO_MANIFEST_DIR = env!("CARGO_MANIFEST_DIR")
-    );
+    None
 }
 
 /// Run a `python scripts/export_tse_onnx.py ...` subcommand. Returns
@@ -152,7 +149,10 @@ fn tse_session_matches_python_onnxruntime() {
         return;
     }
 
-    let root = repo_root();
+    let Some(root) = repo_root() else {
+        eprintln!("[skip] packaged source has no scripts/export_tse_onnx.py");
+        return;
+    };
     let build = root.join("build");
 
     let onnx_path = build.join("tse_smoke.onnx");
