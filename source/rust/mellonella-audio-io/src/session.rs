@@ -1056,6 +1056,20 @@ mod tests {
     }
 
     #[test]
+    fn playback_buffer_timings_follow_the_output_device_sample_rate() {
+        for sample_rate in [44_100_u32, 48_000, 96_000] {
+            let playback = PlaybackBuffer::new(sample_rate);
+            let expected = |milliseconds: u32| {
+                usize::try_from(u64::from(sample_rate) * u64::from(milliseconds) / 1_000)
+                    .expect("test sample count fits usize")
+            };
+            assert_eq!(playback.start_fill, expected(OUTPUT_PREBUFFER_MS));
+            assert_eq!(playback.target_fill, expected(OUTPUT_TARGET_BUFFER_MS));
+            assert_eq!(playback.fade_total, expected(PLAYBACK_FADE_MS));
+        }
+    }
+
+    #[test]
     fn gate_tuning_updates_only_exposed_fields() {
         let base = GateConfig {
             theta_pass: 0.30,

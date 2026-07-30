@@ -499,6 +499,17 @@ fn db_to_lin(db: f32) -> f32 {
     }
 }
 
+/// Convert a live audio sample count for RMS/crossfade arithmetic.
+///
+/// Counts reaching this path are one VAD frame, one model tail, or one
+/// configured transition and are therefore far below f32's exact-integer
+/// range (2²⁴). Keeping the cast here makes that invariant explicit.
+#[allow(clippy::cast_precision_loss)]
+#[inline]
+fn sample_count_as_f32(count: usize) -> f32 {
+    count as f32
+}
+
 /// Transparent soft limiter with a unity-gain region for normal speech.
 ///
 /// `tanh(x)` across the whole waveform sounds compressed well before a
@@ -985,22 +996,41 @@ pub enum ChainMode {
     Overlap,
 }
 
+/// VAD speech decision extended by a hangover: `true` while speech is
+/// present and for `hangover_ms` after it stops.
+///
+/// `silence_ms_since_speech` is reset to zero on every speech frame, so
+/// comparing it against the hangover reuses the exact time constant the
+/// score gate runs on.
+fn speech_held_open(now_speech: bool, silence_ms_since_speech: f32, hangover_ms: f32) -> bool {
+    now_speech || silence_ms_since_speech < hangover_ms
+}
+
 /// Resolve the final gate after the ordinary voiceprint decision and
 /// the adaptive overlap route have both run. Kept as a pure helper so
 /// the security-sensitive "TSE owns overlap selection, voiceprint owns
 /// solo selection" contract is directly testable without ONNX models.
+///
+/// `speech_with_hangover` — **not** the bare per-frame VAD flag — is
+/// what the overlap-bypass branch consumes. Silero drops below its
+/// threshold inside ordinary connected speech (unvoiced stops, weak
+/// fricatives, the quiet tail of a vowel), and the raw flag would
+/// therefore slam the envelope shut and re-open it several times a
+/// second: audible as chopped, gargling speech exactly during the
+/// two-speaker passages this branch exists to serve. The score-gated
+/// branch gets its smoothing from [`GateState`]'s own hangover.
 #[allow(clippy::fn_params_excessive_bools)]
 fn final_gate_decision(
     adaptive: bool,
     chain_mode: ChainMode,
     overlap_bypass_speaker_gate: bool,
-    now_speech: bool,
+    speech_with_hangover: bool,
     is_on_score: bool,
     silence_forced_off: bool,
     turn_forced_off: bool,
 ) -> bool {
     if adaptive && chain_mode == ChainMode::Overlap && overlap_bypass_speaker_gate {
-        now_speech
+        speech_with_hangover && !silence_forced_off
     } else {
         is_on_score && !silence_forced_off && !turn_forced_off
     }
@@ -1950,21 +1980,26 @@ impl StreamingState {
         // Overlap mode TSE has already been conditioned on the trusted
         // enrollment; scoring the louder raw mixture a second time is
         // both redundant and the main source of target-voice dropouts.
-        let adaptive = self.overlap_detector.is_some()
-            && self.tse_stage.is_some()
-            && self.dfn3_stream.is_some();
+        let adaptive = self.adaptive_routing();
         if adaptive {
-            self.update_chain_mode(decision_frame, dt_ms, config)?;
+            self.update_chain_mode(decision_frame, dt_ms, config, out)?;
         }
 
         let is_on_score = self.gate_state.update(gate_score, dt_ms, now_speech);
         let silence_forced_off = pipeline_cfg.silence_force_off_ms > 0.0
             && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms;
+        // Hold the overlap-bypass gate open across sub-hangover VAD
+        // dropouts.
+        let speech_with_hangover = speech_held_open(
+            now_speech,
+            self.silence_ms_since_speech,
+            config.gate.hangover_ms,
+        );
         let is_on = final_gate_decision(
             adaptive,
             self.chain_mode,
             config.overlap_bypass_speaker_gate,
-            now_speech,
+            speech_with_hangover,
             is_on_score,
             silence_forced_off,
             // Stage B, Part 2: offset fail-closed — an extra AND term
@@ -2057,128 +2092,8 @@ impl StreamingState {
                 after_tse
             };
             log_first_nan("after DFN3", &after_dfn3);
-            // Mode-aware level recovery. The universal NS → makeup
-            // pattern (Krisp / Teams / Zoom) — applied **before**
-            // the envelope multiply so gate-off frames stay silent.
-            //
-            // Solo (DFN3-only): static dB gain. DFN3's attenuation
-            // is fairly uniform across speech levels so a fixed
-            // offset is appropriate.
-            //
-            // Overlap (TSE-only): RMS-match the extracted voice to a
-            // target level, then clamp to
-            // `overlap_rms_match_max_gain_db`. The target is either:
-            //   * the rolling EMA of recent **Solo** output RMS
-            //     (`overlap_match_solo_loudness`, default) — keeps
-            //     perceived loudness equal across mode flips and
-            //     stops TSE from being boosted to the (louder) raw
-            //     mixture level, which was saturating the soft-clip
-            //     and producing the "音割れ" the user reported; or
-            //   * the raw-input RMS over this emit chunk (Asteroid's
-            //     canonical Conv-TasNet rescale) as a fallback when
-            //     no Solo EMA exists yet.
-            // Followed by a wet / dry mix that re-injects a small
-            // amount of raw audio to mask Conv-TasNet artefacts.
-            let soft_clip_enabled = config.chain_soft_clip;
-            let target_makeup_lin = match self.chain_mode {
-                ChainMode::Solo => db_to_lin(config.makeup_gain_db_solo),
-                ChainMode::Overlap => {
-                    let static_lin = db_to_lin(config.makeup_gain_db_overlap);
-                    let rms_match_lin = if config.overlap_rms_match && !after_dfn3.is_empty() {
-                        let n = after_dfn3.len();
-                        let out_sum_sq: f32 = after_dfn3.iter().map(|s| s * s).sum();
-                        let out_rms = (out_sum_sq / n.max(1) as f32).sqrt();
-                        // Pick the match target.
-                        let target_rms = if config.overlap_match_solo_loudness
-                            && self.solo_output_rms_ema > 1e-6
-                        {
-                            self.solo_output_rms_ema
-                        } else {
-                            let in_sum_sq: f32 =
-                                self.chain_pending_raw.iter().take(n).map(|s| s * s).sum();
-                            (in_sum_sq / n.max(1) as f32).sqrt()
-                        };
-                        let raw_ratio = target_rms.max(1e-9) / out_rms.max(1e-9);
-                        let max_lin = db_to_lin(config.overlap_rms_match_max_gain_db);
-                        raw_ratio.min(max_lin)
-                    } else {
-                        1.0
-                    };
-                    static_lin * rms_match_lin
-                }
-            };
-            let target_alpha = match self.chain_mode {
-                ChainMode::Solo => 1.0,
-                ChainMode::Overlap => config.overlap_wet_dry_alpha.clamp(0.0, 1.0),
-            };
-
-            let mut solo_active_sum_sq = 0.0_f32;
-            let mut solo_active_count = 0_usize;
-            for &x in &after_dfn3 {
-                let g = self
-                    .chain_pending_gain
-                    .pop_front()
-                    .expect("chain_pending_gain length matches chain input cumulative length");
-                let raw = self
-                    .chain_pending_raw
-                    .pop_front()
-                    .expect("chain_pending_raw length matches chain input cumulative length");
-
-                // Phase 3: per-sample makeup + α crossfade across
-                // the active mode transition. `weight` ramps from
-                // 0.0 (just-switched, still mostly the old mode's
-                // makeup) to 1.0 (fully settled into the new mode).
-                let (makeup_lin, alpha) =
-                    if self.chain_transition_remaining > 0 && self.chain_transition_total > 0 {
-                        let rem = self.chain_transition_remaining as f32;
-                        let tot = self.chain_transition_total as f32;
-                        let weight = 1.0 - rem / tot;
-                        self.chain_transition_remaining -= 1;
-                        let blended_makeup = (1.0 - weight) * self.chain_transition_prev_makeup_lin
-                            + weight * target_makeup_lin;
-                        let blended_alpha = (1.0 - weight) * self.chain_transition_prev_alpha
-                            + weight * target_alpha;
-                        (blended_makeup, blended_alpha)
-                    } else {
-                        (target_makeup_lin, target_alpha)
-                    };
-
-                let chain_processed = x * makeup_lin;
-                let mixed = if self.chain_mode == ChainMode::Overlap && alpha < 1.0 {
-                    alpha * chain_processed + (1.0 - alpha) * raw
-                } else {
-                    chain_processed
-                };
-                let limited = if soft_clip_enabled {
-                    transparent_soft_limit(mixed)
-                } else {
-                    mixed
-                };
-                let sample = limited * g;
-                let sample = if sample.is_finite() { sample } else { 0.0 };
-                // Belt-and-braces: replace any non-finite value
-                // with 0 so a poisoned model state can't push NaN /
-                // Inf to the DAC even if the dither earlier didn't
-                // help.
-                out.audio.push(sample);
-                // Track the Solo path's active-speech output level
-                // (gate substantially open) so the Overlap path can
-                // match it. Gate-off samples are excluded so trailing
-                // silence doesn't drag the loudness target down.
-                if self.chain_mode == ChainMode::Solo && g > 0.5 {
-                    solo_active_sum_sq += sample * sample;
-                    solo_active_count += 1;
-                }
-            }
-            if self.chain_mode == ChainMode::Solo && solo_active_count > 0 {
-                let chunk_rms = (solo_active_sum_sq / solo_active_count as f32).sqrt();
-                let a = config.solo_loudness_ema_alpha.clamp(0.0, 1.0);
-                self.solo_output_rms_ema = if self.solo_output_rms_ema <= 1e-9 {
-                    chunk_rms
-                } else {
-                    (1.0 - a) * self.solo_output_rms_ema + a * chunk_rms
-                };
-            }
+            let mode = self.chain_mode;
+            self.emit_chain_output(&after_dfn3, mode, config, out);
             out.tse_applied = self.tse_stage.is_some();
         } else {
             for (k, &g) in gain.iter().enumerate() {
@@ -2190,22 +2105,196 @@ impl StreamingState {
         Ok(())
     }
 
+    /// Apply level recovery, the mode-transition crossfade, the wet/dry
+    /// mix, soft-clip and the queued envelope gains to one batch of
+    /// chain output, appending the result to `out.audio`.
+    ///
+    /// `mode` is passed explicitly rather than read from
+    /// [`Self::chain_mode`] so the flush at a mode boundary can emit the
+    /// outgoing stage's tail under the settings that produced it.
+    ///
+    /// Emits `min(processed.len(), queued_gains)` samples. In the steady
+    /// path those are equal; a stage flush can hand back more than was
+    /// queued (TSE zero-pads its partial chunk to a full one) and the
+    /// surplus is padding, not audio.
+    fn emit_chain_output(
+        &mut self,
+        processed: &[f32],
+        mode: ChainMode,
+        config: &StreamingConfig,
+        out: &mut StreamingOutput,
+    ) {
+        let n_emit = processed.len().min(self.chain_pending_gain.len());
+        if n_emit == 0 {
+            return;
+        }
+        // Mode-aware level recovery. The universal NS → makeup
+        // pattern (Krisp / Teams / Zoom) — applied **before**
+        // the envelope multiply so gate-off frames stay silent.
+        //
+        // Solo (DFN3-only): static dB gain. DFN3's attenuation
+        // is fairly uniform across speech levels so a fixed
+        // offset is appropriate.
+        //
+        // Overlap (TSE-only): RMS-match the extracted voice to a
+        // target level, then clamp to
+        // `overlap_rms_match_max_gain_db`. The target is either:
+        //   * the rolling EMA of recent **Solo** output RMS
+        //     (`overlap_match_solo_loudness`, default) — keeps
+        //     perceived loudness equal across mode flips and
+        //     stops TSE from being boosted to the (louder) raw
+        //     mixture level, which was saturating the soft-clip
+        //     and producing the "音割れ" the user reported; or
+        //   * the raw-input RMS over this emit chunk (Asteroid's
+        //     canonical Conv-TasNet rescale) as a fallback when
+        //     no Solo EMA exists yet.
+        // Followed by a wet / dry mix that re-injects a small
+        // amount of raw audio to mask Conv-TasNet artefacts.
+        let soft_clip_enabled = config.chain_soft_clip;
+        let target_makeup_lin = match mode {
+            ChainMode::Solo => db_to_lin(config.makeup_gain_db_solo),
+            ChainMode::Overlap => {
+                let static_lin = db_to_lin(config.makeup_gain_db_overlap);
+                let rms_match_lin = if config.overlap_rms_match {
+                    let out_sum_sq: f32 = processed[..n_emit].iter().map(|s| s * s).sum();
+                    let out_rms = (out_sum_sq / sample_count_as_f32(n_emit)).sqrt();
+                    // Pick the match target.
+                    let target_rms =
+                        if config.overlap_match_solo_loudness && self.solo_output_rms_ema > 1e-6 {
+                            self.solo_output_rms_ema
+                        } else {
+                            let in_sum_sq: f32 = self
+                                .chain_pending_raw
+                                .iter()
+                                .take(n_emit)
+                                .map(|s| s * s)
+                                .sum();
+                            (in_sum_sq / sample_count_as_f32(n_emit)).sqrt()
+                        };
+                    let raw_ratio = target_rms.max(1e-9) / out_rms.max(1e-9);
+                    let max_lin = db_to_lin(config.overlap_rms_match_max_gain_db);
+                    raw_ratio.min(max_lin)
+                } else {
+                    1.0
+                };
+                static_lin * rms_match_lin
+            }
+        };
+        let target_alpha = match mode {
+            ChainMode::Solo => 1.0,
+            ChainMode::Overlap => config.overlap_wet_dry_alpha.clamp(0.0, 1.0),
+        };
+
+        let mut solo_active_sum_sq = 0.0_f32;
+        let mut solo_active_count = 0_usize;
+        for &x in &processed[..n_emit] {
+            let (Some(g), Some(raw)) = (
+                self.chain_pending_gain.pop_front(),
+                self.chain_pending_raw.pop_front(),
+            ) else {
+                // `n_emit` is bounded by the gain queue and the two
+                // queues are pushed in lockstep, so this is
+                // unreachable; bail rather than panic in the audio
+                // callback path if it ever isn't.
+                break;
+            };
+
+            // Phase 3: per-sample makeup + α crossfade across
+            // the active mode transition. `weight` ramps from
+            // 0.0 (just-switched, still mostly the old mode's
+            // makeup) to 1.0 (fully settled into the new mode).
+            let (makeup_lin, alpha) =
+                if self.chain_transition_remaining > 0 && self.chain_transition_total > 0 {
+                    let rem = sample_count_as_f32(self.chain_transition_remaining);
+                    let tot = sample_count_as_f32(self.chain_transition_total);
+                    let weight = 1.0 - rem / tot;
+                    self.chain_transition_remaining -= 1;
+                    let blended_makeup = (1.0 - weight) * self.chain_transition_prev_makeup_lin
+                        + weight * target_makeup_lin;
+                    let blended_alpha =
+                        (1.0 - weight) * self.chain_transition_prev_alpha + weight * target_alpha;
+                    (blended_makeup, blended_alpha)
+                } else {
+                    (target_makeup_lin, target_alpha)
+                };
+
+            let chain_processed = x * makeup_lin;
+            let mixed = if mode == ChainMode::Overlap && alpha < 1.0 {
+                alpha * chain_processed + (1.0 - alpha) * raw
+            } else {
+                chain_processed
+            };
+            let limited = if soft_clip_enabled {
+                transparent_soft_limit(mixed)
+            } else {
+                mixed
+            };
+            let sample = limited * g;
+            // Belt-and-braces: replace any non-finite value
+            // with 0 so a poisoned model state can't push NaN /
+            // Inf to the DAC even if the dither earlier didn't
+            // help.
+            let sample = if sample.is_finite() { sample } else { 0.0 };
+            out.audio.push(sample);
+            // Track the Solo path's active-speech output level
+            // (gate substantially open) so the Overlap path can
+            // match it. Gate-off samples are excluded so trailing
+            // silence doesn't drag the loudness target down.
+            if mode == ChainMode::Solo && g > 0.5 {
+                solo_active_sum_sq += sample * sample;
+                solo_active_count += 1;
+            }
+        }
+        if mode == ChainMode::Solo && solo_active_count > 0 {
+            let chunk_rms = (solo_active_sum_sq / sample_count_as_f32(solo_active_count)).sqrt();
+            let a = config.solo_loudness_ema_alpha.clamp(0.0, 1.0);
+            self.solo_output_rms_ema = if self.solo_output_rms_ema <= 1e-9 {
+                chunk_rms
+            } else {
+                (1.0 - a) * self.solo_output_rms_ema + a * chunk_rms
+            };
+        }
+    }
+
+    /// Flush the stage that is active in `mode`, returning whatever
+    /// audio it was still holding.
+    ///
+    /// Under adaptive routing exactly one stage sees audio per chunk, so
+    /// only that one can be holding anything: DFN3 in `Solo` (up to its
+    /// `CONV_LOOKAHEAD` frames ≈ 30 ms), TSE in `Overlap` (up to
+    /// `chunk_samples - 1` ≈ 10 ms).
+    fn flush_active_chain_stage(&mut self, mode: ChainMode) -> Result<Vec<f32>, PipelineError> {
+        match mode {
+            ChainMode::Solo => match self.dfn3_stream.as_mut() {
+                Some(stream) => Ok(stream.flush()?),
+                None => Ok(Vec::new()),
+            },
+            ChainMode::Overlap => match self.tse_stage.as_mut() {
+                Some(stage) => stage.flush().map_err(PipelineError::from),
+                None => Ok(Vec::new()),
+            },
+        }
+    }
+
     /// Feed one VAD-frame-worth of decision-rate audio to the overlap
     /// detector (when present), then advance the hysteresis state
     /// machine that decides which chain — TSE or DFN3 — handles the
     /// next audio_chunk.
     ///
-    /// On a `Solo ↔ Overlap` transition the stage being newly
-    /// activated has its state reset and `chain_pending_gain` is
-    /// cleared. Resetting the freshly-active stage avoids carrying
-    /// stale GRU / accumulator state from when it last ran; clearing
-    /// the gain queue drops the in-flight samples that the old stage
-    /// had buffered (a sub-chunk gap, typically < 30 ms).
+    /// On a `Solo ↔ Overlap` transition the outgoing stage is **flushed
+    /// first** and its tail emitted, then both stages are reset so the
+    /// newly-active one starts without stale GRU / accumulator state.
+    /// Flushing matters: the queued gains track samples still inside the
+    /// stage, so dropping them (as this used to) deleted 10-30 ms of
+    /// audio on every switch. In a two-person conversation the detector
+    /// switches repeatedly, and those repeated holes were audible as the
+    /// crackling the user reported.
     fn update_chain_mode(
         &mut self,
         decision_frame: &[f32],
         _dt_ms: f32,
         config: &StreamingConfig,
+        out: &mut StreamingOutput,
     ) -> Result<(), PipelineError> {
         let Some(detector) = self.overlap_detector.as_mut() else {
             return Ok(());
@@ -2242,6 +2331,14 @@ impl StreamingState {
                     "[streaming] chain mode {:?} → {:?} (overlap_prob mean {:.3})",
                     self.chain_mode, new_mode, decision.mean_overlap_prob
                 );
+                // Drain the outgoing stage before switching so the
+                // samples it still holds reach the output instead of
+                // being discarded with the pending-gain queue below.
+                // Emitted under the *outgoing* mode's level settings —
+                // that's the processing they actually went through.
+                let outgoing = self.chain_mode;
+                let tail = self.flush_active_chain_stage(outgoing)?;
+                self.emit_chain_output(&tail, outgoing, config, out);
                 // Phase 3: snapshot the **outgoing** mode's makeup
                 // settings BEFORE flipping `chain_mode`, so the
                 // emit-loop crossfade can ramp from these values to
@@ -2482,7 +2579,7 @@ impl StreamingState {
         // DFN3.flush drains its conv-lookahead frames. Pending gains
         // are applied to as many emitted samples as we have queued;
         // the rest correspond to zero-padded fillers and are dropped.
-        self.drain_chain_tail(&mut out)?;
+        self.drain_chain_tail(config, &mut out)?;
         Ok(out)
     }
 
@@ -2490,46 +2587,58 @@ impl StreamingState {
     /// DFN3 lookahead buffer into `out.audio`, applying queued gains
     /// 1-to-1 with the chain's final emit. No-op when neither stage is
     /// configured or the pending-gain queue is empty.
-    fn drain_chain_tail(&mut self, out: &mut StreamingOutput) -> Result<(), PipelineError> {
+    fn drain_chain_tail(
+        &mut self,
+        config: &StreamingConfig,
+        out: &mut StreamingOutput,
+    ) -> Result<(), PipelineError> {
         if self.tse_stage.is_none() && self.dfn3_stream.is_none() {
             return Ok(());
         }
         if self.chain_pending_gain.is_empty() {
             return Ok(());
         }
-        // Flush TSE first; if no TSE, the tail is empty.
-        let tse_tail = if let Some(stage) = self.tse_stage.as_mut() {
-            stage.flush().map_err(PipelineError::from)?
+        let chain_tail = if self.adaptive_routing() {
+            // Exactly one stage was active, so only that one holds
+            // anything. Pushing a TSE tail through the bypassed DFN3
+            // would run it through a stage this audio never entered.
+            self.flush_active_chain_stage(self.chain_mode)?
         } else {
-            Vec::new()
-        };
-        // Pass the TSE tail through DFN3 (if active) and then flush
-        // DFN3's lookahead so the very last hop emerges.
-        let chain_tail = if let Some(stream) = self.dfn3_stream.as_mut() {
-            let mut tail = if tse_tail.is_empty() {
-                Vec::new()
+            // Legacy cascade: flush TSE first, feed its tail to DFN3,
+            // then flush DFN3's lookahead so the very last hop emerges.
+            let tse_tail = if let Some(stage) = self.tse_stage.as_mut() {
+                stage.flush().map_err(PipelineError::from)?
             } else {
-                stream.push_samples(&tse_tail)?
+                Vec::new()
             };
-            tail.extend(stream.flush()?);
-            tail
-        } else {
-            tse_tail
+            if let Some(stream) = self.dfn3_stream.as_mut() {
+                let mut tail = if tse_tail.is_empty() {
+                    Vec::new()
+                } else {
+                    stream.push_samples(&tse_tail)?
+                };
+                tail.extend(stream.flush()?);
+                tail
+            } else {
+                tse_tail
+            }
         };
-        // Emit as many samples as we have pending gains for; any
-        // surplus came from TSE's zero-pad and is discarded.
-        let n_take = chain_tail.len().min(self.chain_pending_gain.len());
-        for &x in &chain_tail[..n_take] {
-            let g = self
-                .chain_pending_gain
-                .pop_front()
-                .expect("n_take <= chain_pending_gain.len()");
-            out.audio.push(x * g);
-        }
+        // Emits as many samples as there are pending gains; any surplus
+        // came from TSE's zero-pad and is dropped.
+        let mode = self.chain_mode;
+        self.emit_chain_output(&chain_tail, mode, config, out);
         self.chain_pending_gain.clear();
         self.chain_pending_raw.clear();
         out.tse_applied = self.tse_stage.is_some();
         Ok(())
+    }
+
+    /// Whether adaptive (`Solo`→DFN3 / `Overlap`→TSE) routing is live.
+    /// Requires all three of the overlap detector, TSE and DFN3 — with
+    /// any of them absent there is nothing to switch between and the
+    /// legacy TSE → DFN3 cascade runs instead.
+    fn adaptive_routing(&self) -> bool {
+        self.overlap_detector.is_some() && self.tse_stage.is_some() && self.dfn3_stream.is_some()
     }
 
     /// Async counterpart of [`Self::flush`]. Drains any residue +
@@ -2573,7 +2682,7 @@ impl StreamingState {
         // sync flush so DFN3's lookahead buffer flushes deterministically
         // even in async-refresh mode. (TSE is rejected in async mode at
         // construction time, so only the DFN3-only branch can fire here.)
-        self.drain_chain_tail(&mut out)?;
+        self.drain_chain_tail(config, &mut out)?;
         Ok(out)
     }
 
@@ -2969,6 +3078,37 @@ mod tests {
     }
 
     #[test]
+    fn overlap_bypass_survives_a_short_vad_dropout() {
+        // Silero drops below threshold inside connected speech. Within
+        // the hangover the gate must stay open, or the envelope chops
+        // the audio several times a second.
+        let hangover = 500.0;
+        assert!(speech_held_open(true, 0.0, hangover));
+        assert!(
+            speech_held_open(false, 96.0, hangover),
+            "a 3-frame VAD gap must not close the gate"
+        );
+        assert!(!speech_held_open(false, 500.0, hangover));
+        // A zero hangover reduces to the bare per-frame flag.
+        assert!(!speech_held_open(false, 0.0, 0.0));
+    }
+
+    #[test]
+    fn overlap_bypass_still_closes_on_forced_silence() {
+        // The VAD hangover must not outlive `silence_force_off_ms` —
+        // otherwise a stale decision holds the gate open in a quiet room.
+        assert!(!final_gate_decision(
+            true,
+            ChainMode::Overlap,
+            true,
+            true,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[test]
     fn solo_mode_always_keeps_voiceprint_fail_closed() {
         assert!(!final_gate_decision(
             true,
@@ -2996,6 +3136,63 @@ mod tests {
         assert_eq!(cfg.audio_sample_rate, 48_000);
         assert_eq!(cfg.pipeline.sample_rate, 16_000);
         assert!(!cfg.diagnostics);
+    }
+
+    /// Chain state with `n` queued sample gains, as if `n` samples were
+    /// handed to the audio chain and are still buffered inside it.
+    fn state_with_pending_chain_samples(n: usize) -> (StreamingState, StreamingConfig) {
+        let mut cfg = StreamingConfig::default();
+        cfg.audio_sample_rate = cfg.pipeline.sample_rate;
+        // Keep the level maths out of the way — unity makeup, no clip.
+        cfg.makeup_gain_db_solo = 0.0;
+        cfg.chain_soft_clip = false;
+        cfg.mode_transition_crossfade_samples = 0;
+        let mut state = StreamingState::new(&cfg).expect("state");
+        state
+            .chain_pending_gain
+            .extend(std::iter::repeat(1.0).take(n));
+        state
+            .chain_pending_raw
+            .extend(std::iter::repeat(0.0).take(n));
+        (state, cfg)
+    }
+
+    #[test]
+    fn emit_chain_output_drops_the_flush_zero_pad_surplus() {
+        // `TseStage::flush` zero-pads its partial chunk to a full one, so
+        // a stage flush hands back more samples than were queued. The
+        // surplus is padding: emitting it would inject a tail of
+        // synthetic audio, and popping gains for it would desynchronise
+        // the envelope from the audio for the rest of the session.
+        let (mut state, cfg) = state_with_pending_chain_samples(100);
+        let mut out = StreamingOutput::default();
+        let flushed = vec![0.5_f32; 480];
+        state.emit_chain_output(&flushed, ChainMode::Solo, &cfg, &mut out);
+        assert_eq!(out.audio.len(), 100, "only the queued samples are real");
+        assert!(state.chain_pending_gain.is_empty());
+        assert!(state.chain_pending_raw.is_empty());
+    }
+
+    #[test]
+    fn emit_chain_output_is_a_noop_with_nothing_queued() {
+        // The path a mode switch takes when the outgoing stage happened
+        // to be empty: no queued gains, so nothing may be emitted.
+        let (mut state, cfg) = state_with_pending_chain_samples(0);
+        let mut out = StreamingOutput::default();
+        state.emit_chain_output(&[0.5_f32; 64], ChainMode::Solo, &cfg, &mut out);
+        assert!(out.audio.is_empty());
+    }
+
+    #[test]
+    fn emit_chain_output_applies_the_queued_gain() {
+        let (mut state, cfg) = state_with_pending_chain_samples(4);
+        state.chain_pending_gain.clear();
+        state
+            .chain_pending_gain
+            .extend([0.0_f32, 0.5, 1.0, 1.0].iter().copied());
+        let mut out = StreamingOutput::default();
+        state.emit_chain_output(&[1.0_f32; 4], ChainMode::Solo, &cfg, &mut out);
+        assert_eq!(out.audio, vec![0.0, 0.5, 1.0, 1.0]);
     }
 
     #[test]
