@@ -5,6 +5,7 @@
 //! [`LiveSession`] to stop; the cpal streams are torn down and the
 //! worker exits on the next iteration.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,10 +29,38 @@ use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 /// chunks provide enough headroom without ever blocking the real-time
 /// callback; the worker drains them immediately after each inference.
 const INPUT_RING_CHUNKS: usize = 64;
-/// The output side receives a whole selected one-second block at once.
-/// It therefore needs only a small slot count; the cpal callback keeps
-/// the remaining samples in its local carry buffer.
-const OUTPUT_RING_CHUNKS: usize = 6;
+/// Hand-off slots between the worker and the output callback. The
+/// callback drains **all** of them on every wake-up, so this only has to
+/// absorb one worker burst (the worker catches up at ~2× realtime after
+/// a stall); the actual play-out depth lives in the callback's carry
+/// buffer.
+const OUTPUT_RING_CHUNKS: usize = 32;
+
+/// Play-out buffer depth, in mono samples at [`INTERNAL_SAMPLE_RATE`],
+/// that the output callback fills before it starts playing — and refills
+/// to after an underrun.
+///
+/// The worker is purely input-driven: it produces a chunk only when the
+/// mic delivers one, so without an explicit buffer the play-out depth
+/// hovers at roughly one chunk and *any* processing spike starves the
+/// DAC. Spikes are routine here — the overlap detector runs a 1-second
+/// pyannote window every 250 ms on this thread — so the un-buffered
+/// steady state was a dropout several times a second, which is what the
+/// crackling reports come from.
+///
+/// 60 ms covers the measured worst-case spike with margin while staying
+/// well inside a comfortable end-to-end budget for voice chat.
+const OUTPUT_PREFILL_SAMPLES: usize = INTERNAL_SAMPLE_RATE as usize * 60 / 1000;
+/// Depth above which the output callback skips forward, back down to
+/// [`OUTPUT_PREFILL_SAMPLES`].
+///
+/// The capture and playback devices run off independent crystals, so
+/// their rates differ by tens of ppm no matter what they report. The
+/// slow direction empties the buffer (an underrun, which re-primes); the
+/// fast direction fills it, and without a ceiling the latency would
+/// creep up for the whole call. 240 ms is high enough that ordinary
+/// jitter never trips it.
+const OUTPUT_MAX_BUFFERED_SAMPLES: usize = OUTPUT_PREFILL_SAMPLES * 4;
 
 /// Lock-free gate controls and diagnostics shared by the GUI and audio
 /// worker. The worker snapshots these immediately before each pipeline
@@ -819,11 +848,15 @@ fn build_output_stream(
     let mut resampler =
         StreamingResampler::new(INTERNAL_SAMPLE_RATE, device_sr).map_err(AudioIoError::Resample)?;
     let channels_usize = channels as usize;
-    // Carry-over mono samples that didn't fit in the previous
-    // callback's device buffer. cpal's output callback hands us a
-    // fixed-size scratch slice each time; remaining samples wait
-    // for the next call.
-    let mut carry: Vec<f32> = Vec::new();
+    // Play-out buffer. Every callback drains the whole hand-off ring
+    // into this, so its length alone is the current output latency —
+    // which is what the prefill / ceiling logic below regulates. A
+    // `VecDeque` keeps the per-callback consume off the front O(1).
+    let mut carry: VecDeque<f32> = VecDeque::new();
+    // While priming, the callback emits silence and keeps filling.
+    // Starts `true` so the session opens with a full buffer instead of
+    // stuttering its way up to one.
+    let mut priming = true;
     // Diagnostics: print the first callback so users can confirm cpal
     // is actually calling us, and the first underrun so silent output
     // bugs surface in the console. Heavy logging in the steady state
@@ -832,6 +865,7 @@ fn build_output_stream(
     let mut first_call = true;
     let mut first_underrun_logged = false;
     let mut first_ring_chunk_logged = false;
+    let mut first_overflow_logged = false;
     let err_fn = |e: cpal::StreamError| eprintln!("[audio-io] output stream error: {e}");
     device
         .build_output_stream(
@@ -840,16 +874,14 @@ fn build_output_stream(
                 let frames_needed = data.len() / channels_usize;
                 if first_call {
                     eprintln!(
-                        "[audio-io] output: first cpal callback fired ({frames_needed} frames × {channels_usize} ch)"
+                        "[audio-io] output: first cpal callback fired ({frames_needed} frames × {channels_usize} ch), \
+                         priming {OUTPUT_PREFILL_SAMPLES} samples"
                     );
                     first_call = false;
                 }
-                // Top up the carry buffer until it has enough mono
-                // samples to fill `data`, draining the output ring.
-                while carry.len() < frames_needed {
-                    let Ok(chunk) = output_rx.try_recv() else {
-                        break;
-                    };
+                // Drain the whole ring so `carry.len()` is the single
+                // description of how much audio is buffered.
+                while let Ok(chunk) = output_rx.try_recv() {
                     if !first_ring_chunk_logged && !chunk.is_empty() {
                         eprintln!(
                             "[audio-io] output: first ring chunk received ({} samples @ {} Hz)",
@@ -862,35 +894,58 @@ fn build_output_stream(
                         Some(r) => r.process(&chunk).unwrap_or_default(),
                         None => chunk,
                     };
-                    carry.extend_from_slice(&resampled);
+                    carry.extend(resampled.iter().copied());
                 }
-                if carry.len() < frames_needed {
+                // Clock drift (or a worker burst after a stall) can push
+                // the buffer past the ceiling. Skip forward rather than
+                // carry the extra latency for the rest of the call.
+                if carry.len() > OUTPUT_MAX_BUFFERED_SAMPLES {
+                    let excess = carry.len() - OUTPUT_PREFILL_SAMPLES;
+                    carry.drain(..excess);
+                    if !first_overflow_logged {
+                        eprintln!(
+                            "[audio-io] output: buffer ceiling hit, skipped {excess} samples \
+                             back to {OUTPUT_PREFILL_SAMPLES} (playback clock slower than \
+                             capture). Occasional entries here are normal drift correction."
+                        );
+                        first_overflow_logged = true;
+                    }
+                }
+                if priming {
+                    if carry.len() >= OUTPUT_PREFILL_SAMPLES.max(frames_needed) {
+                        priming = false;
+                    }
+                } else if carry.len() < frames_needed {
+                    // Starved. Re-prime instead of emitting a partial
+                    // buffer: a clean short mute is far less audible
+                    // than a torn waveform, and the retained `carry`
+                    // means playback resumes exactly where it stopped.
+                    priming = true;
                     underruns.fetch_add(1, Ordering::Relaxed);
                     if !first_underrun_logged {
                         eprintln!(
-                            "[audio-io] output: first underrun — wanted {} frames, ring \
-                             produced {} (worker behind or output device draining faster \
-                             than the pipeline runs). If this keeps logging, check that \
-                             the input mic is also producing samples.",
+                            "[audio-io] output: first underrun — wanted {} frames, had {} \
+                             (worker behind). Re-priming {OUTPUT_PREFILL_SAMPLES} samples. \
+                             Repeated entries in the periodic stats line mean a persistent \
+                             CPU shortfall, not jitter.",
                             frames_needed,
                             carry.len()
                         );
                         first_underrun_logged = true;
                     }
                 }
-                // Broadcast mono → all output channels. Silence on
-                // underrun.
+                // Broadcast mono → all output channels. Silence while
+                // priming.
                 for frame_idx in 0..frames_needed {
-                    let mono = carry.get(frame_idx).copied().unwrap_or(0.0);
+                    let mono = if priming {
+                        0.0
+                    } else {
+                        carry.pop_front().unwrap_or(0.0)
+                    };
                     let base = frame_idx * channels_usize;
                     for ch in 0..channels_usize {
                         data[base + ch] = Sample::from_sample(mono);
                     }
-                }
-                if carry.len() > frames_needed {
-                    carry.drain(..frames_needed);
-                } else {
-                    carry.clear();
                 }
             },
             err_fn,
