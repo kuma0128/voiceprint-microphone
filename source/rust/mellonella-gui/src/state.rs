@@ -292,26 +292,44 @@ fn preferred_device_from_env(env_var: &str, devices: &[AudioDevice]) -> Option<S
 /// Default on-disk location for the auto-saved enrollment:
 /// `<dirs::config_dir>/mellonella/enrollment.json`. Returns `None` on
 /// platforms where `dirs::config_dir()` is unavailable (rare).
+fn mellonella_config_dir() -> Option<PathBuf> {
+    #[cfg(not(test))]
+    {
+        Some(dirs::config_dir()?.join("mellonella"))
+    }
+    #[cfg(test)]
+    {
+        // Tests that exercise auto-loading must never rename or delete the
+        // user's real biometric profile. A thread-local directory also keeps
+        // concurrently-running tests from racing over one shared fixture.
+        thread_local! {
+            static TEST_CONFIG_DIR: PathBuf = std::env::temp_dir().join(format!(
+                "mellonella-tests-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            )).join("mellonella");
+        }
+        TEST_CONFIG_DIR.with(Clone::clone).into()
+    }
+}
+
 #[must_use]
 pub fn default_enrollment_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("enrollment.json"))
+    Some(mellonella_config_dir()?.join("enrollment.json"))
 }
 
 /// Companion profile used only to identify SepFormer's anonymous
 /// output streams.
 #[must_use]
 pub fn default_separator_enrollment_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("enrollment-separator.json"))
+    Some(mellonella_config_dir()?.join("enrollment-separator.json"))
 }
 
 /// On-disk location of the persisted separator fail-closed threshold —
 /// a single plain-text float next to the enrollment JSON.
 #[must_use]
 pub fn separator_threshold_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("separator-threshold.txt"))
+    Some(mellonella_config_dir()?.join("separator-threshold.txt"))
 }
 
 /// Persisted live gate controls. A small text format keeps this
@@ -319,8 +337,14 @@ pub fn separator_threshold_path() -> Option<PathBuf> {
 /// safe defaults: `<threshold> <hangover_ms> <release_ms>`.
 #[must_use]
 pub fn gate_settings_path() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("mellonella");
-    Some(dir.join("gate-settings.txt"))
+    Some(mellonella_config_dir()?.join("gate-settings.txt"))
+}
+
+/// Threshold file written by packaged builds before the live gate UI
+/// started persisting all three controls together. Keep reading it as a
+/// fallback so an upgrade cannot silently make the filter stricter again.
+fn legacy_voiceprint_threshold_path() -> Option<PathBuf> {
+    Some(mellonella_config_dir()?.join("voiceprint-threshold.txt"))
 }
 
 fn default_gate_config() -> GateConfig {
@@ -335,23 +359,34 @@ fn default_gate_config() -> GateConfig {
 
 fn load_gate_config() -> GateConfig {
     let mut config = default_gate_config();
-    let Some(text) = gate_settings_path().and_then(|path| std::fs::read_to_string(path).ok())
-    else {
-        return config;
-    };
-    let values: Vec<f32> = text
-        .split_whitespace()
-        .filter_map(|part| part.parse::<f32>().ok())
-        .collect();
-    if let [threshold, hangover_ms, release_ms, ..] = values.as_slice() {
-        if (0.15..=0.85).contains(threshold)
-            && (100.0..=1_200.0).contains(hangover_ms)
-            && (30.0..=400.0).contains(release_ms)
-        {
-            config.theta_pass = *threshold;
-            config.hangover_ms = *hangover_ms;
-            config.release_ms = *release_ms;
+    if let Some(text) = gate_settings_path().and_then(|path| std::fs::read_to_string(path).ok()) {
+        let values: Vec<f32> = text
+            .split_whitespace()
+            .filter_map(|part| part.parse::<f32>().ok())
+            .collect();
+        if let [threshold, hangover_ms, release_ms, ..] = values.as_slice() {
+            if (0.15..=0.85).contains(threshold)
+                && (100.0..=1_200.0).contains(hangover_ms)
+                && (30.0..=400.0).contains(release_ms)
+            {
+                config.theta_pass = *threshold;
+                config.hangover_ms = *hangover_ms;
+                config.release_ms = *release_ms;
+                return config;
+            }
         }
+    }
+
+    // v1 stored only the threshold. It is more important to preserve a
+    // value calibrated against this person's real voice than to replace
+    // it with the newer global default. The first UI adjustment writes
+    // the new three-value file and naturally completes the migration.
+    if let Some(threshold) = legacy_voiceprint_threshold_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<f32>().ok())
+        .filter(|value| (0.15..=0.85).contains(value))
+    {
+        config.theta_pass = threshold;
     }
     config
 }
@@ -381,6 +416,9 @@ fn load_separator_threshold() -> f32 {
 ///   speaker compared with the old 1 s / 500 ms cadence.
 /// * `score_ema_alpha = 0.9` — react quickly to the newer speaker
 ///   embedding; gate hangover handles isolated target-score dips.
+/// * `async_refresh = true` — ECAPA/Fbank runs off the audio worker so
+///   its periodic inference cannot starve the output callback and turn
+///   otherwise clean speech into regular gaps.
 /// * `sv_min_new_samples_after_silence = 1600` — fire the
 ///   post-silence early refresh after only 100 ms of new speech
 ///   (instead of the library-default 250 ms) so `last_score` catches
@@ -400,6 +438,7 @@ pub fn default_live_pipeline_cfg() -> PipelineConfig {
         sv_window_samples: 12_000,
         sv_update_samples: 4_000,
         score_ema_alpha: 0.90,
+        async_refresh: true,
         sv_min_new_samples_after_silence: 1_600,
         // Never adapt a biometric reference from live Discord audio:
         // a sustained friend could otherwise drift the target profile.
@@ -1484,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn start_records_an_error_when_no_audio_device_is_available() {
+    fn start_records_an_error_for_an_invalid_audio_device() {
         let Some((ecapa, vad)) = skip_if_no_onnx() else {
             return;
         };
@@ -1492,23 +1531,13 @@ mod tests {
         with_test_enrollment(&pool, || {
             let mut state = AppState::default();
             assert!(state.pool.is_some(), "precondition: pool auto-loaded");
+            // Never open the developer/user's real microphone from a unit
+            // test. An impossible explicit name deterministically exercises
+            // the same construction-error path on every machine.
+            state.selected_input = Some("__mellonella_test_missing_input__".to_string());
             state.start();
-            // Headless container has no cpal device → start() must
-            // surface an error and leave no half-constructed session.
-            // (If audio is somehow available, the session is fine —
-            // stop it to keep the test hermetic.)
-            let has_err = state.last_error.is_some();
-            let has_session = state.session.is_some();
-            assert!(
-                has_err ^ has_session,
-                "expected exactly one of last_error / session after start(); \
-                 err={:?}, has_session={has_session}",
-                state.last_error
-            );
-            if has_session {
-                state.stop();
-                assert!(state.session.is_none());
-            }
+            assert!(state.last_error.is_some());
+            assert!(state.session.is_none());
         });
     }
 
@@ -1521,6 +1550,22 @@ mod tests {
             })
             .collect();
         assert!(validate_enrollment_capture(&audio, OUTPUT_SAMPLE_RATE).is_ok());
+    }
+
+    #[test]
+    fn legacy_voiceprint_threshold_is_migrated_when_new_settings_are_absent() {
+        let legacy = legacy_voiceprint_threshold_path().expect("test config dir");
+        let current = gate_settings_path().expect("test config dir");
+        if let Some(parent) = legacy.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&current);
+        std::fs::write(&legacy, "0.398\n").unwrap();
+        let config = load_gate_config();
+        assert!((config.theta_pass - 0.398).abs() < f32::EPSILON);
+        assert!((config.hangover_ms - DEFAULT_GATE_HANGOVER_MS).abs() < f32::EPSILON);
+        assert!((config.release_ms - DEFAULT_GATE_RELEASE_MS).abs() < f32::EPSILON);
+        let _ = std::fs::remove_file(legacy);
     }
 
     #[test]

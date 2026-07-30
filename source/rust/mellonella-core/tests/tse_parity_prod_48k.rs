@@ -28,20 +28,17 @@ const N_CHUNKS: usize = 8;
 const TOTAL: usize = CHUNK * N_CHUNKS;
 const TOL: f32 = 1e-4;
 
-fn repo_root() -> PathBuf {
+fn repo_root() -> Option<PathBuf> {
     let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for _ in 0..4 {
         if here.join("scripts/export_tse_onnx.py").exists() {
-            return here;
+            return Some(here);
         }
         if !here.pop() {
             break;
         }
     }
-    panic!(
-        "cannot locate repo root from CARGO_MANIFEST_DIR={CARGO_MANIFEST_DIR}",
-        CARGO_MANIFEST_DIR = env!("CARGO_MANIFEST_DIR")
-    );
+    None
 }
 
 fn run_python(args: &[&str], root: &Path) -> Result<(), String> {
@@ -113,7 +110,10 @@ fn tse_session_matches_python_onnxruntime_prod_48k() {
         return;
     }
 
-    let root = repo_root();
+    let Some(root) = repo_root() else {
+        eprintln!("[skip] packaged source has no scripts/export_tse_onnx.py");
+        return;
+    };
     let build = root.join("build");
 
     let onnx_path = build.join("tse_prod_48k.onnx");

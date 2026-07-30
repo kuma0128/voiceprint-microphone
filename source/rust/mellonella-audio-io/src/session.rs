@@ -5,6 +5,7 @@
 //! [`LiveSession`] to stop; the cpal streams are torn down and the
 //! worker exits on the next iteration.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,10 +29,138 @@ use crate::{AudioIoError, ChannelStrategy, INTERNAL_SAMPLE_RATE};
 /// chunks provide enough headroom without ever blocking the real-time
 /// callback; the worker drains them immediately after each inference.
 const INPUT_RING_CHUNKS: usize = 64;
-/// The output side receives a whole selected one-second block at once.
-/// It therefore needs only a small slot count; the cpal callback keeps
-/// the remaining samples in its local carry buffer.
-const OUTPUT_RING_CHUNKS: usize = 6;
+/// Enough output headroom for short scheduler / model-inference stalls.
+/// The callback drains this channel into a sample-based elastic buffer,
+/// so a larger slot count does not itself add latency.
+const OUTPUT_RING_CHUNKS: usize = 64;
+/// Prime the output path before playback begins. The old callback started
+/// draining immediately, so every normal 32 ms pipeline burst was followed
+/// by a race against the next device callback and periodic silence sounded
+/// like a broken / crackling signal on the Discord side.
+const OUTPUT_PREBUFFER_MS: u32 = 64;
+/// Fill level the elastic clock bridge gently steers toward.
+const OUTPUT_TARGET_BUFFER_MS: u32 = 96;
+/// Maximum input/output hardware-clock correction. Two independent devices
+/// are never exactly 48 kHz; ±0.2 % is ample for real hardware drift and is
+/// small enough to be inaudible as pitch movement.
+const MAX_CLOCK_CORRECTION: f64 = 0.002;
+const PLAYBACK_FADE_MS: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybackStatus {
+    Rendered,
+    Prebuffering,
+    Underrun,
+}
+
+/// Sample-based jitter buffer and asynchronous clock bridge between the
+/// microphone and output devices.
+///
+/// Even when both devices advertise 48 kHz, their physical oscillators drift.
+/// A plain FIFO must therefore eventually either empty or overflow. This
+/// buffer uses linear interpolation with a tiny fill-dependent read-rate
+/// correction, keeping the queue centred without dropping whole 32 ms chunks.
+struct PlaybackBuffer {
+    samples: VecDeque<f32>,
+    read_position: f64,
+    target_fill: usize,
+    start_fill: usize,
+    fade_total: usize,
+    fade_remaining: usize,
+    started: bool,
+    last_output: f32,
+}
+
+impl PlaybackBuffer {
+    fn new(sample_rate: u32) -> Self {
+        let millis_to_samples = |ms: u32| {
+            (u64::from(sample_rate) * u64::from(ms) / 1_000)
+                .try_into()
+                .unwrap_or(usize::MAX)
+        };
+        Self {
+            samples: VecDeque::new(),
+            read_position: 0.0,
+            target_fill: millis_to_samples(OUTPUT_TARGET_BUFFER_MS),
+            start_fill: millis_to_samples(OUTPUT_PREBUFFER_MS),
+            fade_total: millis_to_samples(PLAYBACK_FADE_MS).max(1),
+            fade_remaining: 0,
+            started: false,
+            last_output: 0.0,
+        }
+    }
+
+    fn push(&mut self, samples: &[f32]) {
+        self.samples.extend(samples.iter().copied());
+    }
+
+    fn buffered_samples(&self) -> usize {
+        self.samples.len()
+    }
+
+    fn playback_step(&self) -> f64 {
+        if self.target_fill == 0 {
+            return 1.0;
+        }
+        let error = self.samples.len() as f64 / self.target_fill as f64 - 1.0;
+        1.0 + (error * MAX_CLOCK_CORRECTION).clamp(-MAX_CLOCK_CORRECTION, MAX_CLOCK_CORRECTION)
+    }
+
+    fn render(&mut self, output: &mut [f32]) -> PlaybackStatus {
+        output.fill(0.0);
+        if output.is_empty() {
+            return PlaybackStatus::Rendered;
+        }
+        if !self.started {
+            // Two callbacks of margin cover unusually large device periods;
+            // the ordinary path starts at the fixed 64 ms prebuffer.
+            let required = self.start_fill.max(output.len().saturating_mul(2));
+            if self.samples.len() < required {
+                return PlaybackStatus::Prebuffering;
+            }
+            self.started = true;
+            self.fade_remaining = self.fade_total;
+        }
+
+        let step = self.playback_step();
+        let final_position = self.read_position + step * output.len().saturating_sub(1) as f64;
+        let final_index = final_position.floor() as usize;
+        if final_index.saturating_add(1) >= self.samples.len() {
+            // This should be exceptional after priming. Fade the previous
+            // sample to zero instead of making a full-scale discontinuity,
+            // then wait for the prebuffer to refill.
+            let fade = self.fade_total.min(output.len());
+            for (index, slot) in output.iter_mut().take(fade).enumerate() {
+                *slot = self.last_output * (1.0 - (index + 1) as f32 / fade as f32);
+            }
+            self.started = false;
+            self.read_position = 0.0;
+            self.last_output = 0.0;
+            return PlaybackStatus::Underrun;
+        }
+
+        for slot in output.iter_mut() {
+            let index = self.read_position.floor() as usize;
+            let fraction = (self.read_position - index as f64) as f32;
+            let left = self.samples[index];
+            let right = self.samples[index + 1];
+            let mut sample = left + (right - left) * fraction;
+            if self.fade_remaining > 0 {
+                let gain = 1.0 - self.fade_remaining as f32 / self.fade_total as f32;
+                sample *= gain;
+                self.fade_remaining -= 1;
+            }
+            *slot = sample;
+            self.last_output = sample;
+            self.read_position += step;
+        }
+
+        let consumed = self.read_position.floor() as usize;
+        self.samples.drain(..consumed);
+        self.read_position -= consumed as f64;
+        PlaybackStatus::Rendered
+    }
+}
 
 /// Lock-free gate controls and diagnostics shared by the GUI and audio
 /// worker. The worker snapshots these immediately before each pipeline
@@ -192,7 +321,8 @@ pub struct LiveSessionStats {
     /// can't keep up).
     pub input_overruns: u64,
     /// Output chunks where the output ring was empty and silence
-    /// was emitted (worker fell behind).
+    /// was emitted after playback had already started (worker fell
+    /// behind). Intentional startup prebuffering is not counted.
     pub output_underruns: u64,
 }
 
@@ -819,11 +949,8 @@ fn build_output_stream(
     let mut resampler =
         StreamingResampler::new(INTERNAL_SAMPLE_RATE, device_sr).map_err(AudioIoError::Resample)?;
     let channels_usize = channels as usize;
-    // Carry-over mono samples that didn't fit in the previous
-    // callback's device buffer. cpal's output callback hands us a
-    // fixed-size scratch slice each time; remaining samples wait
-    // for the next call.
-    let mut carry: Vec<f32> = Vec::new();
+    let mut playback = PlaybackBuffer::new(device_sr);
+    let mut mono_scratch: Vec<f32> = Vec::new();
     // Diagnostics: print the first callback so users can confirm cpal
     // is actually calling us, and the first underrun so silent output
     // bugs surface in the console. Heavy logging in the steady state
@@ -844,12 +971,11 @@ fn build_output_stream(
                     );
                     first_call = false;
                 }
-                // Top up the carry buffer until it has enough mono
-                // samples to fill `data`, draining the output ring.
-                while carry.len() < frames_needed {
-                    let Ok(chunk) = output_rx.try_recv() else {
-                        break;
-                    };
+                // Drain every produced chunk. `PlaybackBuffer` owns the
+                // sample-level fill target and clock correction; leaving
+                // chunks parked in this slot-based ring would hide its
+                // true fill level and eventually force a whole-chunk drop.
+                while let Ok(chunk) = output_rx.try_recv() {
                     if !first_ring_chunk_logged && !chunk.is_empty() {
                         eprintln!(
                             "[audio-io] output: first ring chunk received ({} samples @ {} Hz)",
@@ -862,35 +988,30 @@ fn build_output_stream(
                         Some(r) => r.process(&chunk).unwrap_or_default(),
                         None => chunk,
                     };
-                    carry.extend_from_slice(&resampled);
+                    playback.push(&resampled);
                 }
-                if carry.len() < frames_needed {
+
+                mono_scratch.resize(frames_needed, 0.0);
+                let buffered_before = playback.buffered_samples();
+                let status = playback.render(&mut mono_scratch);
+                if status == PlaybackStatus::Underrun {
                     underruns.fetch_add(1, Ordering::Relaxed);
                     if !first_underrun_logged {
                         eprintln!(
-                            "[audio-io] output: first underrun — wanted {} frames, ring \
-                             produced {} (worker behind or output device draining faster \
-                             than the pipeline runs). If this keeps logging, check that \
-                             the input mic is also producing samples.",
-                            frames_needed,
-                            carry.len()
+                            "[audio-io] output: first underrun after playback start — wanted \
+                             {frames_needed} frames with {buffered_before} buffered (worker \
+                             behind). Rebuffering before audio resumes."
                         );
                         first_underrun_logged = true;
                     }
                 }
                 // Broadcast mono → all output channels. Silence on
-                // underrun.
-                for frame_idx in 0..frames_needed {
-                    let mono = carry.get(frame_idx).copied().unwrap_or(0.0);
+                // startup prebuffer / underrun.
+                for (frame_idx, &mono) in mono_scratch.iter().enumerate() {
                     let base = frame_idx * channels_usize;
                     for ch in 0..channels_usize {
                         data[base + ch] = Sample::from_sample(mono);
                     }
-                }
-                if carry.len() > frames_needed {
-                    carry.drain(..frames_needed);
-                } else {
-                    carry.clear();
                 }
             },
             err_fn,
@@ -903,6 +1024,36 @@ fn build_output_stream(
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_buffer_primes_before_emitting() {
+        let mut playback = PlaybackBuffer::new(1_000);
+        let mut output = vec![1.0; 10];
+        playback.push(&vec![0.25; 63]);
+        assert_eq!(playback.render(&mut output), PlaybackStatus::Prebuffering);
+        assert!(output.iter().all(|&sample| sample == 0.0));
+
+        playback.push(&[0.25; 40]);
+        assert_eq!(playback.render(&mut output), PlaybackStatus::Rendered);
+        assert!(output.iter().all(|sample| (0.0..=0.25).contains(sample)));
+        assert!(output.iter().skip(5).any(|&sample| sample > 0.0));
+    }
+
+    #[test]
+    fn playback_buffer_corrects_independent_device_clock_drift() {
+        let mut playback = PlaybackBuffer::new(48_000);
+        playback.push(&vec![0.0; playback.target_fill]);
+        let centred = playback.playback_step();
+        playback.push(&vec![0.0; playback.target_fill]);
+        let overfilled = playback.playback_step();
+        playback.samples.truncate(playback.target_fill / 2);
+        let underfilled = playback.playback_step();
+        assert!((centred - 1.0).abs() < f64::EPSILON);
+        assert!(overfilled > 1.0, "overfilled queue must drain faster");
+        assert!(underfilled < 1.0, "underfilled queue must drain slower");
+        assert!(overfilled <= 1.0 + MAX_CLOCK_CORRECTION);
+        assert!(underfilled >= 1.0 - MAX_CLOCK_CORRECTION);
+    }
 
     #[test]
     fn gate_tuning_updates_only_exposed_fields() {

@@ -55,7 +55,7 @@ use mellonella_core::pipeline::{
 use mellonella_core::streaming::{StreamingConfig, StreamingOutput, StreamingPipeline};
 use mellonella_core::tse::{TseConfig, TSE_COND_DIM};
 use mellonella_core::tse_stage::TseStageConfig;
-use mellonella_core::vad::SileroVad;
+use mellonella_core::vad::{SileroVad, CHUNK_SAMPLES_16K};
 
 const FILTERBANK: &[u8] = include_bytes!("fixtures/fbank_filterbank.bin");
 
@@ -98,20 +98,22 @@ fn synth_waveform(sample_rate: u32, duration_sec: f32, f0: f32) -> Vec<f32> {
 
 /// Locate the repo root by walking up from `CARGO_MANIFEST_DIR`. Same
 /// pattern as `tests/tse_parity.rs` and `tests/pipeline_tse_smoke.rs`.
-fn repo_root() -> PathBuf {
+fn repo_root() -> Option<PathBuf> {
     let mut here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for _ in 0..4 {
         if here.join("scripts/export_tse_onnx.py").exists() {
-            return here;
+            return Some(here);
         }
         if !here.pop() {
             break;
         }
     }
-    panic!(
-        "cannot locate repo root from CARGO_MANIFEST_DIR={CARGO_MANIFEST_DIR}",
-        CARGO_MANIFEST_DIR = env!("CARGO_MANIFEST_DIR")
+    eprintln!(
+        "[skip] packaged source has no scripts/export_tse_onnx.py under \
+         CARGO_MANIFEST_DIR={}",
+        env!("CARGO_MANIFEST_DIR")
     );
+    None
 }
 
 /// Build / reuse the smoke TSE ONNX. Returns `Some(path)` when the
@@ -119,7 +121,7 @@ fn repo_root() -> PathBuf {
 /// the caller should skip the test. Identical to the helper in
 /// `pipeline_tse_smoke.rs` so both test suites share the cached file.
 fn ensure_tse_smoke_onnx() -> Option<PathBuf> {
-    let root = repo_root();
+    let root = repo_root()?;
     let build = root.join("build");
     let onnx_path = build.join("tse_smoke.onnx");
     let weights_path = build.join("tse_smoke.onnx.weights.pt");
@@ -281,9 +283,11 @@ fn streaming_default_is_byte_identical_with_tse_off() {
         "TSE-off gate_per_frame diverged"
     );
 
-    // Streaming output length is bounded — at identity rate (no
-    // resampler) it equals the input length exactly.
-    assert_eq!(result_a.audio.len(), audio.len());
+    // At identity rate there is no resampler delay, but flush() still
+    // zero-pads the final partial VAD frame. The emitted stream may
+    // therefore contain up to one frame minus one sample of padded tail.
+    assert!(result_a.audio.len() >= audio.len());
+    assert!(result_a.audio.len() - audio.len() < CHUNK_SAMPLES_16K);
 }
 
 /// TSE enabled produces non-trivial, finite output that differs from
