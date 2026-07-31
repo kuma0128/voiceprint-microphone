@@ -6,7 +6,7 @@
 
 use eframe::egui;
 
-use crate::state::{AppState, EnrollmentOrigin};
+use crate::state::{AppState, EnrollmentOrigin, MIN_GATE_THRESHOLD};
 use crate::tray::{TrayCommand, TrayHandles};
 
 /// Guided enrollment text deliberately mixes vowels, voiced/unvoiced
@@ -435,7 +435,9 @@ impl MellonellaApp {
         }
         ui.weak(
             "一人で話しながらスコアを確認し、その少し下まで下げてください。\
-             下げるほど他人の声も通りやすくなります。変更は即時反映されます。",
+             下げるほど他人の声も通りやすくなります。0.40より下げられないのは、\
+             それ以下だと声の似た人の発話が半分ほど通ってしまうためです。\
+             変更は即時反映されます。",
         );
     }
 
@@ -447,7 +449,7 @@ impl MellonellaApp {
         let mut release_ms = self.state.gate_tuning.release_ms();
         let changed = ui
             .add(
-                egui::Slider::new(&mut threshold, 0.15..=0.85)
+                egui::Slider::new(&mut threshold, MIN_GATE_THRESHOLD..=0.85)
                     .step_by(0.01)
                     .text("厳しさ"),
             )
@@ -476,7 +478,7 @@ impl MellonellaApp {
         ui.horizontal(|ui| {
             ui.label("プリセット:");
             if ui.small_button("途切れにくい").clicked() {
-                self.state.set_gate_preset(0.36, 700.0, 180.0);
+                self.state.set_gate_preset(MIN_GATE_THRESHOLD, 700.0, 180.0);
             }
             if ui.small_button("標準").clicked() {
                 self.state.set_gate_preset(0.45, 500.0, 120.0);
@@ -490,6 +492,11 @@ impl MellonellaApp {
             "変更は実行中でも即時反映・自動保存されます。本人まで抑制される場合は厳しさを\
              0.03ずつ下げるか途切れ保護を伸ばし、友達が通る場合は厳しさを0.03ずつ上げます。\
              二人同時に話す区間は別の本人抽出モデルが自動処理します。",
+        );
+        ui.weak(
+            "他人の声は、しきい値だけでなく「その場で聞こえた別人の声」との比較でも判定します。\
+             相手が話し始めてから約0.5秒は声紋の判定材料が足りないため通ることがありますが、\
+             話し続ける限り遮断されます。あなた一人のときは、この処理は動きません。",
         );
     }
 

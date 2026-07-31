@@ -13,6 +13,7 @@ pub mod f0;
 pub mod features;
 pub mod gating;
 pub mod hf_fetch;
+pub mod nontarget;
 pub mod ort_threads;
 pub mod overlap;
 pub mod pipeline;

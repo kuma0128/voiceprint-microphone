@@ -55,6 +55,30 @@ const MIN_ENROLLMENT_CONSISTENCY: f32 = 0.40;
 pub const DEFAULT_GATE_THRESHOLD: f32 = 0.45;
 pub const DEFAULT_GATE_HANGOVER_MS: f32 = 500.0;
 pub const DEFAULT_GATE_RELEASE_MS: f32 = 120.0;
+/// Lowest threshold the live slider (and any persisted settings file)
+/// may select.
+///
+/// Below this a same-sex speaker stops being an occasional false accept
+/// and becomes a steady one: measured on same-sex, same-language pairs,
+/// an unrelated speaker's median 1 s score is 0.35, so a threshold of
+/// 0.35 passes roughly half of everything they say. The floor is the
+/// backstop; [`mellonella_core::nontarget`] is what makes thresholds in
+/// this range usable at all.
+pub const MIN_GATE_THRESHOLD: f32 = 0.40;
+/// How far the enrolled speaker must beat the best-matching other
+/// speaker heard this session. Measured on same-sex, same-language
+/// pairs: impostor windows sit at −0.37 (median) on this quantity and
+/// peak at +0.05, while the enrolled speaker's 5th percentile is +0.19,
+/// so 0.08 lands in a gap both distributions leave empty.
+pub const DEFAULT_OTHER_SPEAKER_MARGIN: f32 = 0.08;
+/// Hangover stops protecting an open gate once the score falls below
+/// this fraction of the threshold — see
+/// [`mellonella_core::gating::GateConfig::hangover_floor_frac`]. At 0.6
+/// the enrolled speaker's normal inter-syllable dips still ride through
+/// (their 5th-percentile score is ~0.95× the threshold), while a
+/// one-window false accept closes on the next refresh instead of leaking
+/// a full hangover of somebody else's voice.
+pub const DEFAULT_HANGOVER_FLOOR_FRAC: f32 = 0.6;
 
 /// Where the current enrollment came from. Surfaced in the UI so
 /// users see "Recorded 5.0 s" vs the auto-loaded persistent pool.
@@ -358,6 +382,12 @@ fn default_gate_config() -> GateConfig {
         adaptive_theta: false,
         hangover_ms: DEFAULT_GATE_HANGOVER_MS,
         release_ms: DEFAULT_GATE_RELEASE_MS,
+        // A raw cosine threshold cannot separate a same-sex friend from
+        // the enrolled speaker on its own — their score distributions
+        // overlap. These two terms are what close that gap; both are
+        // live-only, the library defaults leave them off.
+        other_speaker_margin: DEFAULT_OTHER_SPEAKER_MARGIN,
+        hangover_floor_frac: DEFAULT_HANGOVER_FLOOR_FRAC,
         ..GateConfig::default()
     }
 }
@@ -383,8 +413,15 @@ fn load_gate_config() -> GateConfig {
                     && (100.0..=1_200.0).contains(hangover_ms)
                     && (30.0..=400.0).contains(release_ms)
                 {
+                    // A stricter personal threshold is always honoured;
+                    // a looser one is clamped. Values below
+                    // `MIN_GATE_THRESHOLD` pass roughly half of a
+                    // same-sex speaker's audio, and users reach for the
+                    // slider precisely when the gate is misbehaving —
+                    // so the one direction that must not be available is
+                    // the one that makes it worse.
                     config.theta_pass = if versioned {
-                        *threshold
+                        threshold.max(MIN_GATE_THRESHOLD)
                     } else {
                         threshold.max(DEFAULT_GATE_THRESHOLD)
                     };
@@ -450,6 +487,17 @@ pub fn default_live_pipeline_cfg() -> PipelineConfig {
         // hangover still rejects a changed speaker; this rule exists
         // only to prevent a stale gate from remaining open in silence.
         silence_force_off_ms: 700.0,
+        // A conversation changes hands across a pause, and the identity
+        // window would otherwise carry the previous speaker across it —
+        // which is where nearly all of a similar-sounding friend's audio
+        // was getting through. Has to sit *below* the turn gaps it needs
+        // to catch; 250 ms covers ordinary turn-taking, and it costs a
+        // solo session nothing because it only arms once a second voice
+        // has been heard.
+        turn_boundary_silence_ms: 250.0,
+        // Re-qualify on half a window so the enrolled speaker waits
+        // ~0.5 s, not a full second, before their voice comes back.
+        sv_reopen_window_samples: 8_000,
         // One second is the shortest measured window that keeps the
         // enrolled speaker comfortably separated from an impostor.
         sv_window_samples: 16_000,
@@ -898,6 +946,14 @@ impl AppState {
                     GateConfig {
                         theta_pass: 0.0,
                         adaptive_theta: false,
+                        // Both identity terms have to go with the
+                        // threshold: with `theta_pass = 0.0` the
+                        // other-speaker model can never learn (nothing
+                        // scores below zero) while its margin would
+                        // still block quiet windows, which is the exact
+                        // second rejection this branch exists to avoid.
+                        other_speaker_margin: 0.0,
+                        hangover_floor_frac: 0.0,
                         ..self.gate_cfg
                     }
                 } else {
@@ -999,7 +1055,8 @@ impl AppState {
 
     /// Apply one coherent live preset, then persist it.
     pub fn set_gate_preset(&mut self, threshold: f32, hangover_ms: f32, release_ms: f32) {
-        self.gate_tuning.set_threshold(threshold);
+        self.gate_tuning
+            .set_threshold(threshold.max(MIN_GATE_THRESHOLD));
         self.gate_tuning.set_hangover_ms(hangover_ms);
         self.gate_tuning.set_release_ms(release_ms);
         self.save_gate_settings();
@@ -1636,11 +1693,33 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         let _ = std::fs::remove_file(&legacy);
-        std::fs::write(&current, "v2 0.398 650 140\n").unwrap();
+        std::fs::write(&current, "v2 0.520 650 140\n").unwrap();
         let config = load_gate_config();
-        assert!((config.theta_pass - 0.398).abs() < f32::EPSILON);
+        assert!((config.theta_pass - 0.520).abs() < f32::EPSILON);
         assert!((config.hangover_ms - 650.0).abs() < f32::EPSILON);
         assert!((config.release_ms - 140.0).abs() < f32::EPSILON);
+        let _ = std::fs::remove_file(current);
+    }
+
+    #[test]
+    fn versioned_gate_settings_are_clamped_up_to_the_safe_floor() {
+        // Users reach for this slider when the gate misbehaves, and the
+        // direction that *feels* like it helps — lowering it — is the one
+        // that lets a same-sex speaker through wholesale: their median
+        // 1 s score is ~0.35. Stricter settings are still honoured
+        // verbatim; only the unsafe direction is capped.
+        let legacy = legacy_voiceprint_threshold_path().expect("test config dir");
+        let current = gate_settings_path().expect("test config dir");
+        if let Some(parent) = current.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&legacy);
+        std::fs::write(&current, "v2 0.350 300 80\n").unwrap();
+        let config = load_gate_config();
+        assert!((config.theta_pass - MIN_GATE_THRESHOLD).abs() < f32::EPSILON);
+        // The other two controls are not safety-critical and stay as set.
+        assert!((config.hangover_ms - 300.0).abs() < f32::EPSILON);
+        assert!((config.release_ms - 80.0).abs() < f32::EPSILON);
         let _ = std::fs::remove_file(current);
     }
 

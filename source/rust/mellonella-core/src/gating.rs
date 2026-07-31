@@ -244,6 +244,29 @@ pub struct GateConfig {
     /// Minimum continuous speech run length (seconds) before auto-learn
     /// admission. Mirrors `min_continuous_speech_sec` in Python.
     pub min_continuous_speech_sec: f32,
+    /// How far the enrolled speaker must out-score the best-matching
+    /// known other speaker before the gate opens.
+    ///
+    /// `0.0` switches the whole mechanism off: the streaming engine
+    /// stops maintaining [`crate::nontarget::OtherSpeakers`] and always
+    /// reports an other-speaker score of `0.0`, so the term vanishes.
+    /// That is the default, which keeps the offline pipeline and the
+    /// plugin crates byte-identical. The live GUI sets `0.08`.
+    ///
+    /// Even when enabled the term stays inert until the model has
+    /// actually learned somebody, and it only ever learns from audio
+    /// this gate is already rejecting — so a solo session never sees it.
+    pub other_speaker_margin: f32,
+    /// Fraction of the pass threshold below which [`Self::hangover_ms`]
+    /// stops protecting an open gate.
+    ///
+    /// Hangover exists to ride out the shallow dips in the enrolled
+    /// speaker's own score between syllables. It should not also protect
+    /// a score that has *collapsed*, which is what a one-window false
+    /// accept looks like on the very next window — without this, every
+    /// such spike leaks a full `hangover_ms` of somebody else's audio.
+    /// `0.0` restores the unconditional pre-fix behaviour.
+    pub hangover_floor_frac: f32,
     /// When `true`, the gate tracks the running speech-score
     /// distribution and adapts the pass threshold to it (#120) instead
     /// of comparing against the static `theta_pass`.
@@ -276,6 +299,10 @@ impl Default for GateConfig {
             theta_learn_as_norm: 3.25,
             theta_f0: 0.7,
             min_continuous_speech_sec: 1.0,
+            // Both default to the pre-fix behaviour so `pipeline_parity`
+            // and the plugin crates are unaffected; the live GUI opts in.
+            other_speaker_margin: 0.0,
+            hangover_floor_frac: 0.0,
             adaptive_theta: true,
         }
     }
@@ -373,18 +400,45 @@ impl GateState {
     /// adaptive-threshold tracking (#120) and is otherwise unused.
     /// Returns the binary decision the caller should feed into the
     /// envelope.
+    ///
+    /// Equivalent to [`Self::update_against`] with no other speaker
+    /// known.
     pub fn update(&mut self, score: f32, dt_ms: f32, vad_speech: bool) -> bool {
+        self.update_against(score, 0.0, dt_ms, vad_speech)
+    }
+
+    /// [`Self::update`], plus the other-speaker margin test.
+    ///
+    /// `other_score` is how well this window matches the best-matching
+    /// speaker that [`crate::nontarget::OtherSpeakers`] has heard and
+    /// rejected during this session (`0.0` when none are known). The
+    /// gate opens only when the enrolled speaker both clears the
+    /// threshold *and* wins by [`GateConfig::other_speaker_margin`].
+    pub fn update_against(
+        &mut self,
+        score: f32,
+        other_score: f32,
+        dt_ms: f32,
+        vad_speech: bool,
+    ) -> bool {
         if self.config.adaptive_theta && vad_speech {
             self.observe_speech_score(score);
         }
-        if score >= self.effective_theta_pass() {
+        let theta = self.effective_theta_pass();
+        let out_scores_others = score - other_score >= self.config.other_speaker_margin;
+        if score >= theta && out_scores_others {
             self.is_on = true;
             self.elapsed_off_ms = 0.0;
             return true;
         }
         if self.is_on {
             self.elapsed_off_ms += dt_ms;
-            if self.elapsed_off_ms < self.config.hangover_ms {
+            // Hangover rides out the enrolled speaker's own shallow dips.
+            // A score that has collapsed well below threshold — or one
+            // that a known other speaker now out-scores — is not a dip,
+            // and holding the gate open for it just leaks their audio.
+            let collapsed = score < theta * self.config.hangover_floor_frac;
+            if self.elapsed_off_ms < self.config.hangover_ms && !collapsed && out_scores_others {
                 return true;
             }
             self.is_on = false;
@@ -795,6 +849,89 @@ mod tests {
         assert!(gate.update(0.0, 100.0, false));
         assert!(gate.update(0.0, 99.0, false));
         assert!(!gate.update(0.0, 10.0, false));
+    }
+
+    #[test]
+    fn other_speaker_margin_blocks_a_score_that_matches_someone_else_better() {
+        let cfg = GateConfig {
+            theta_pass: 0.45,
+            other_speaker_margin: 0.08,
+            adaptive_theta: false,
+            ..GateConfig::default()
+        };
+        let mut gate = GateState::new(cfg);
+        // Clears the threshold, but a known other speaker matches it
+        // better — this is exactly the same-sex friend whose occasional
+        // window spikes over the threshold.
+        assert!(!gate.update_against(0.50, 0.72, 32.0, true));
+        assert!(!gate.is_on());
+        // The enrolled speaker clears it and wins by more than the
+        // margin.
+        assert!(gate.update_against(0.50, 0.30, 32.0, true));
+    }
+
+    #[test]
+    fn other_speaker_margin_is_inert_with_nobody_else_known() {
+        let cfg = GateConfig {
+            theta_pass: 0.45,
+            other_speaker_margin: 0.08,
+            adaptive_theta: false,
+            ..GateConfig::default()
+        };
+        let mut gate = GateState::new(cfg);
+        // `OtherSpeakers::score` returns 0.0 for an empty model, so the
+        // margin must not eat into the ordinary threshold decision.
+        assert!(gate.update_against(0.46, 0.0, 32.0, true));
+    }
+
+    #[test]
+    fn margin_failure_also_ends_the_hangover() {
+        // Once somebody else out-scores the enrolled speaker, hangover
+        // must not keep holding the gate open for them.
+        let cfg = GateConfig {
+            theta_pass: 0.45,
+            other_speaker_margin: 0.08,
+            hangover_ms: 500.0,
+            adaptive_theta: false,
+            ..GateConfig::default()
+        };
+        let mut gate = GateState::new(cfg);
+        assert!(gate.update_against(0.70, 0.20, 32.0, true));
+        assert!(!gate.update_against(0.50, 0.80, 32.0, true));
+    }
+
+    #[test]
+    fn hangover_floor_closes_immediately_on_a_collapsed_score() {
+        let cfg = GateConfig {
+            theta_pass: 0.45,
+            hangover_ms: 500.0,
+            hangover_floor_frac: 0.6,
+            adaptive_theta: false,
+            ..GateConfig::default()
+        };
+        let mut gate = GateState::new(cfg);
+        assert!(gate.update(0.70, 32.0, true));
+        // A shallow dip — the enrolled speaker between syllables — is
+        // still protected.
+        assert!(gate.update(0.40, 32.0, true));
+        // A collapse is not a dip: 0.10 is below 0.6 x 0.45, so the gate
+        // shuts now instead of leaking the rest of the hangover.
+        assert!(!gate.update(0.10, 32.0, true));
+    }
+
+    #[test]
+    fn hangover_floor_of_zero_keeps_the_unconditional_hangover() {
+        let cfg = GateConfig {
+            theta_pass: 0.45,
+            hangover_ms: 500.0,
+            hangover_floor_frac: 0.0,
+            adaptive_theta: false,
+            ..GateConfig::default()
+        };
+        let mut gate = GateState::new(cfg);
+        assert!(gate.update(0.70, 32.0, true));
+        assert!(gate.update(0.0, 32.0, true));
+        assert!(gate.is_on());
     }
 
     #[test]

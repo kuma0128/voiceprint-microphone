@@ -110,11 +110,34 @@ pub struct EmbeddingPool {
     /// Element-wise mean of `anchors` (`E_enroll`), recomputed whenever
     /// the anchor set changes. `None` while there are no anchors.
     anchor_centroid: Option<Vec<f32>>,
+    /// `anchors` agglomerated into at most [`MAX_CONDITION_GROUPS`]
+    /// acoustic conditions, one mean vector each. Recomputed whenever
+    /// the anchor set changes; these — not the raw anchors — are what
+    /// [`Self::match_score`] compares against. Empty while there are
+    /// no anchors.
+    condition_centroids: Vec<Vec<f32>>,
     /// Cached `λ·anchor_centroid + (1-λ)·evidence`, recomputed whenever
     /// `evidence` changes. `None` until the first admission. Cached so
     /// per-refresh [`Self::match_score`] does not re-blend the vector.
     adapted: Option<Vec<f32>>,
 }
+
+/// Upper bound on how many distinct acoustic conditions an enrollment
+/// profile is modelled as holding (morning voice, evening voice, an
+/// extra `+声紋を追加登録` registration, …).
+pub const MAX_CONDITION_GROUPS: usize = 4;
+/// Target anchors per condition group. Averaging this many 3 s windows
+/// is what cancels the per-window noise that makes a single anchor an
+/// easy target for an unrelated speaker.
+pub const MIN_ANCHORS_PER_GROUP: usize = 4;
+/// Two groups are the same acoustic condition only if their means are
+/// at least this similar.
+///
+/// Measured intra-session anchor similarity is mean 0.85 / p10 0.80, so
+/// 0.70 merges windows of one recording while leaving a genuinely
+/// separate registration standing on its own — which is what keeps the
+/// `+声紋を追加登録` contract ("another registration can only help") true.
+pub const CONDITION_MERGE_COS: f32 = 0.70;
 
 /// Element-wise mean of `vectors`, or `None` for an empty slice.
 ///
@@ -139,6 +162,55 @@ fn elementwise_mean(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
     Some(sum)
 }
 
+/// Group `anchors` into acoustic conditions and return one mean vector
+/// per group.
+///
+/// Agglomerative: start with one group per anchor and repeatedly merge
+/// the closest pair (by cosine between group means), subject to two
+/// stopping rules that pull in opposite directions and are both load
+/// bearing:
+///
+/// * **the budget** — `anchors / MIN_ANCHORS_PER_GROUP` capped at
+///   [`MAX_CONDITION_GROUPS`] — forces the windows of one recording to
+///   collapse into a few averaged means, which is what removes the
+///   per-anchor lottery an impostor otherwise wins on one noisy window.
+/// * **[`CONDITION_MERGE_COS`]** stops the budget from steamrollering a
+///   genuinely separate registration into the average of another one.
+///   Two anchors from different acoustic conditions stay apart even at a
+///   budget of 1, so an extra `+声紋を追加登録` can still only ever raise
+///   the enrolled speaker's recall.
+///
+/// A single-anchor pool yields that anchor verbatim, so
+/// [`EmbeddingPool::match_score`] stays exactly `cos(emb, anchor)`.
+fn condition_groups(anchors: &[Vec<f32>]) -> Vec<Vec<f32>> {
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+    let budget = (anchors.len() / MIN_ANCHORS_PER_GROUP).clamp(1, MAX_CONDITION_GROUPS);
+    let mut groups: Vec<Vec<Vec<f32>>> = anchors.iter().map(|a| vec![a.clone()]).collect();
+    let mut means: Vec<Vec<f32>> = anchors.to_vec();
+    while groups.len() > budget {
+        let mut best = (0_usize, 1_usize, f32::NEG_INFINITY);
+        for i in 0..means.len() {
+            for j in i + 1..means.len() {
+                let s = cos_similarity(&means[i], &means[j]);
+                if s > best.2 {
+                    best = (i, j, s);
+                }
+            }
+        }
+        let (i, j, similarity) = best;
+        if similarity < CONDITION_MERGE_COS {
+            break;
+        }
+        let merged = groups.remove(j);
+        means.remove(j);
+        groups[i].extend(merged);
+        means[i] = elementwise_mean(&groups[i]).expect("non-empty group");
+    }
+    means
+}
+
 impl EmbeddingPool {
     #[must_use]
     pub fn new(config: EmbeddingPoolConfig) -> Self {
@@ -148,6 +220,7 @@ impl EmbeddingPool {
             evidence: None,
             metadata: EnrollmentMetadata::default(),
             anchor_centroid: None,
+            condition_centroids: Vec::new(),
             adapted: None,
         }
     }
@@ -213,6 +286,7 @@ impl EmbeddingPool {
             self.anchors.push(emb.into());
         }
         self.anchor_centroid = elementwise_mean(&self.anchors);
+        self.condition_centroids = condition_groups(&self.anchors);
         // The adapted embedding depends on the centroid; keep it in
         // sync (a no-op in the normal flow — anchors are added once at
         // enrollment, before any runtime admission).
@@ -226,27 +300,38 @@ impl EmbeddingPool {
         self.anchor_centroid.as_deref()
     }
 
+    /// The acoustic-condition means [`Self::match_score`] compares
+    /// against — see [`condition_groups`]. Empty for an empty pool.
+    #[must_use]
+    pub fn condition_centroids(&self) -> &[Vec<f32>] {
+        &self.condition_centroids
+    }
+
     /// Pool match score for `emb`: the **maximum** cosine similarity
-    /// over every reference the pool holds — each individual anchor,
-    /// their centroid, and the λ-residual adapted embedding.
+    /// over the acoustic-condition means plus the λ-residual adapted
+    /// embedding.
     ///
     /// Each term earns its place:
     ///
-    /// * **per-anchor max** — a profile deliberately holds anchors from
-    ///   several acoustic conditions (morning voice, evening voice, extra
-    ///   registrations added via `+声紋を追加登録`). Those conditions sit
-    ///   in *different* directions in embedding space, so averaging them
-    ///   into one vector scores every one of them worse than itself.
-    ///   Taking the max means an extra registration can only ever raise
-    ///   the enrolled speaker's recall, which is the contract the UI
-    ///   advertises. Measured on the `test-audio` fixtures, at a 1 s
-    ///   window this lifts the enrolled speaker's 5th-percentile score
-    ///   0.643 → 0.671 while moving an unrelated speaker's worst case
-    ///   only 0.324 → 0.328 — i.e. it buys margin, it doesn't just shift
-    ///   the scale.
-    /// * **centroid** — retained in the max because averaging cancels
-    ///   per-window noise, so for a single-condition profile it often
-    ///   beats every individual anchor.
+    /// * **per-condition max** — a profile deliberately holds anchors
+    ///   from several acoustic conditions (morning voice, evening voice,
+    ///   extra registrations added via `+声紋を追加登録`). Those conditions
+    ///   sit in *different* directions in embedding space, so averaging
+    ///   them all into one vector scores every one of them worse than
+    ///   itself. Taking the max over conditions means an extra
+    ///   registration can only ever raise the enrolled speaker's recall,
+    ///   which is the contract the UI advertises.
+    /// * **averaging inside a condition** — the max runs over
+    ///   [`condition_groups`] means, *not* over raw anchors. A raw-anchor
+    ///   max hands an unrelated speaker one lottery ticket per anchor,
+    ///   and with a 20 s enrollment that is a dozen chances to get lucky
+    ///   on a single noisy window. Measured on same-sex, same-language
+    ///   speaker pairs at `theta_pass = 0.45`, dropping the raw-anchor
+    ///   terms takes an impostor from 10.8 % of windows leaking to 0.0 %,
+    ///   for +0.4 pp of enrolled-speaker loss. (The earlier raw-anchor
+    ///   measurement that justified the max — +0.028 on the target's p05
+    ///   for +0.004 of impostor max — was taken against an *opposite-sex*
+    ///   impostor, where the margin was wide enough to hide the cost.)
     /// * **adapted** — lets a candidate matching the current runtime
     ///   condition score well even when enrollment was recorded under a
     ///   different one.
@@ -256,10 +341,9 @@ impl EmbeddingPool {
     #[must_use]
     pub fn match_score(&self, emb: &[f32]) -> f32 {
         let best = self
-            .anchors
+            .condition_centroids
             .iter()
             .map(Vec::as_slice)
-            .chain(self.anchor_centroid.as_deref())
             .chain(self.adapted.as_deref())
             .map(|reference| cos_similarity(emb, reference))
             .fold(f32::NEG_INFINITY, f32::max);
@@ -326,6 +410,7 @@ impl EmbeddingPool {
         let emb = emb.into();
         self.anchors.push(emb);
         self.anchor_centroid = elementwise_mean(&self.anchors);
+        self.condition_centroids = condition_groups(&self.anchors);
         self.metadata = EnrollmentMetadata { f0_mu, f0_sigma };
         // `evidence` stays None — the bootstrapped anchor IS the
         // entire pool for now; subsequent `adapt` calls will populate
@@ -481,12 +566,14 @@ impl PoolPayload {
         // FIFO instead — migrate it by taking its mean.
         let evidence = self.evidence.or_else(|| elementwise_mean(&self.auto_learn));
         let anchor_centroid = elementwise_mean(&self.anchors);
+        let condition_centroids = condition_groups(&self.anchors);
         let mut pool = EmbeddingPool {
             config,
             anchors: self.anchors,
             evidence,
             metadata: self.metadata,
             anchor_centroid,
+            condition_centroids,
             adapted: None,
         };
         pool.recompute_adapted();
@@ -613,6 +700,54 @@ mod tests {
             score > centroid_score,
             "per-anchor max {score} must beat the centroid {centroid_score}"
         );
+    }
+
+    #[test]
+    fn many_similar_anchors_collapse_into_a_few_condition_means() {
+        // The reason this matters: a max taken over a dozen raw anchors
+        // hands an unrelated speaker a dozen chances to get lucky on one
+        // noisy window, which is what let a same-sex impostor through.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        // 12 anchors scattered around one direction, as one recording's
+        // sliding windows are.
+        let anchors: Vec<Vec<f32>> = (0..12)
+            .map(|i| {
+                let mut v = vec![0.0_f32; 8];
+                v[0] = 1.0;
+                v[1 + i % 6] = 0.12 * (1.0 + (i % 3) as f32);
+                v
+            })
+            .collect();
+        pool.add_anchors(anchors);
+        assert!(
+            pool.condition_centroids().len() <= MAX_CONDITION_GROUPS,
+            "12 same-condition anchors must not stay 12 references, got {}",
+            pool.condition_centroids().len()
+        );
+        assert!(!pool.condition_centroids().is_empty());
+    }
+
+    #[test]
+    fn distinct_registrations_survive_the_group_budget() {
+        // Two acoustically distant registrations, far more than the
+        // budget of one group they would get on count alone. Averaging
+        // them together would match neither, so they must stay apart.
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        let mut anchors: Vec<Vec<f32>> = Vec::new();
+        for i in 0..4_u8 {
+            anchors.push(unit(&[1.0, 0.05 * f32::from(i), 0.0]));
+            anchors.push(unit(&[0.0, 0.05 * f32::from(i), 1.0]));
+        }
+        pool.add_anchors(anchors);
+        assert!(
+            pool.condition_centroids().len() >= 2,
+            "two distinct conditions must not be merged"
+        );
+        // A probe sitting on either condition scores near 1.0.
+        for probe in [unit(&[1.0, 0.0, 0.0]), unit(&[0.0, 0.0, 1.0])] {
+            let s = pool.match_score(&probe);
+            assert!(s > 0.95, "score={s} for a probe on an enrolled condition");
+        }
     }
 
     #[test]
