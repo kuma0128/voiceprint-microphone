@@ -106,10 +106,10 @@ use crate::f0::{
     DEFAULT_THRESHOLD,
 };
 use crate::features::{Fbank, N_MELS};
-use crate::nontarget::{OtherSpeakerConfig, OtherSpeakers};
 use crate::gating::{
     as_norm_score, f0_match, should_admit_auto_learn, EnvelopeState, GateConfig, GateState,
 };
+use crate::nontarget::{OtherSpeakerConfig, OtherSpeakers};
 use crate::pipeline::{
     apply_refresh_result, fbank_ecapa_one, smooth_score, tse_cond_embedding, AutoLearnEvent,
     AutoLearnKind, PipelineComponents, PipelineConfig, PipelineError, ScoreState,
@@ -1331,7 +1331,23 @@ fn score_and_learn_others(
         score.others_known = false;
         return;
     }
-    score.last_other = others.score(embedding);
+    // The other-speaker model reasons about `theta_pass` as the level at
+    // which a target score vouches for the enrolled speaker — that is
+    // what stops a mislearned cluster locking its owner out. An adapted
+    // threshold admits at up to half that, well below the level where
+    // the score means anything, so the two features are incompatible.
+    // Every shipped configuration that sets the margin disables it.
+    debug_assert!(
+        !gate_cfg.adaptive_theta,
+        "other_speaker_margin requires a fixed pass threshold; see nontarget's module docs"
+    );
+    score.last_other = others.score_for_gate(
+        embedding,
+        target_score,
+        gate_cfg.theta_pass,
+        gate_cfg.other_speaker_margin,
+        other_cfg,
+    );
     others.observe(
         embedding,
         target_score,
@@ -3224,6 +3240,7 @@ mod tests {
     /// Named-argument view of [`final_gate_decision`] for the tests —
     /// eight positional bools at the call site is unreadable.
     #[derive(Clone, Copy)]
+    #[allow(clippy::struct_excessive_bools)]
     struct GateInputs {
         adaptive: bool,
         chain_mode: ChainMode,

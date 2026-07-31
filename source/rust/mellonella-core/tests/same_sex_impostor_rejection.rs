@@ -173,9 +173,10 @@ fn run_call(
     for t in 0..turns {
         for (src, tag) in [(impostor, false), (held, true)] {
             audio.extend_from_slice(&src[t * TURN..(t + 1) * TURN]);
-            is_target.extend(std::iter::repeat_n(tag, TURN));
-            audio.extend(std::iter::repeat_n(0.0, TURN_GAP));
-            is_target.extend(std::iter::repeat_n(tag, TURN_GAP));
+            // `repeat_n` is Rust 1.82; keep the workspace's 1.75 MSRV.
+            is_target.extend(std::iter::repeat(tag).take(TURN));
+            audio.extend(std::iter::repeat(0.0).take(TURN_GAP));
+            is_target.extend(std::iter::repeat(tag).take(TURN_GAP));
         }
     }
 
