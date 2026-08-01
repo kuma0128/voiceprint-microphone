@@ -122,14 +122,14 @@ fn components(ecapa: &PathBuf, vad: &PathBuf) -> PipelineComponents {
 
 /// The live GUI's identity cadence, at the decision rate so the test
 /// needs no resampler.
-fn live_pipeline_cfg(turn_boundary_silence_ms: f32) -> PipelineConfig {
+fn live_pipeline_cfg(turn_boundary_silence_ms: f32, async_refresh: bool) -> PipelineConfig {
     PipelineConfig {
         sample_rate: SR,
         silence_force_off_ms: 700.0,
         sv_window_samples: 16_000,
         sv_update_samples: 4_000,
         score_ema_alpha: 0.90,
-        async_refresh: false,
+        async_refresh,
         sv_min_new_samples_after_silence: 1_600,
         enable_auto_learn: false,
         turn_boundary_silence_ms,
@@ -153,6 +153,7 @@ struct Survival {
 fn run_call(
     gate: GateConfig,
     turn_boundary_silence_ms: f32,
+    async_refresh: bool,
     target: &[f32],
     impostor: &[f32],
     comp: PipelineComponents,
@@ -181,15 +182,23 @@ fn run_call(
     }
 
     let cfg = StreamingConfig {
-        pipeline: live_pipeline_cfg(turn_boundary_silence_ms),
+        pipeline: live_pipeline_cfg(turn_boundary_silence_ms, async_refresh),
         gate,
         audio_sample_rate: SR,
         ..Default::default()
     };
     let mut pipeline = StreamingPipeline::new(pool, cfg, comp).expect("pipeline");
     let mut out: Vec<f32> = Vec::new();
-    for chunk in audio.chunks(PUSH) {
+    for (chunk_idx, chunk) in audio.chunks(PUSH).enumerate() {
         out.extend(pipeline.push_samples(chunk).expect("push").audio);
+        // The live async worker receives one identity job per 250 ms
+        // of audio. This test pushes synthetic device chunks much faster
+        // than real time, so yield at that same boundary; otherwise it
+        // measures an intentionally overloaded queue instead of the
+        // shipped live path.
+        if async_refresh && (chunk_idx + 1) % (4_000 / PUSH) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
     out.extend(pipeline.flush().expect("flush").audio);
 
@@ -239,6 +248,7 @@ fn similar_impostor_is_filtered_while_the_enrolled_speaker_survives() {
     let run = run_call(
         live_gate(),
         250.0,
+        false,
         &target,
         &impostor,
         components(&ecapa, &vad),
@@ -271,6 +281,40 @@ fn similar_impostor_is_filtered_while_the_enrolled_speaker_survives() {
 }
 
 #[test]
+fn async_live_path_filters_the_same_sex_impostor() {
+    let Some((ecapa, vad, target_wav, impostor_wav)) = skip_if_missing() else {
+        return;
+    };
+    let target = read_pcm16_mono_wav(&target_wav);
+    let impostor = read_pcm16_mono_wav(&impostor_wav);
+
+    let run = run_call(
+        live_gate(),
+        250.0,
+        true,
+        &target,
+        &impostor,
+        components(&ecapa, &vad),
+    );
+    eprintln!(
+        "async shipped gate: target survives {:.1}%, impostor leaks {:.1}%",
+        100.0 * run.target,
+        100.0 * run.impostor
+    );
+    assert!(
+        run.impostor < 0.15,
+        "async same-sex impostor leakage is too high: {:.1}%",
+        100.0 * run.impostor
+    );
+    assert!(
+        run.target > 0.65,
+        "async path suppressed too much enrolled speech: {:.1}%",
+        100.0 * run.target
+    );
+    assert!(run.target > run.impostor * 5.0);
+}
+
+#[test]
 fn the_turn_boundary_purge_is_what_removes_the_bulk_of_the_leak() {
     let Some((ecapa, vad, target_wav, impostor_wav)) = skip_if_missing() else {
         return;
@@ -283,6 +327,7 @@ fn the_turn_boundary_purge_is_what_removes_the_bulk_of_the_leak() {
     let without = run_call(
         live_gate(),
         0.0,
+        false,
         &target,
         &impostor,
         components(&ecapa, &vad),
@@ -290,6 +335,7 @@ fn the_turn_boundary_purge_is_what_removes_the_bulk_of_the_leak() {
     let with = run_call(
         live_gate(),
         250.0,
+        false,
         &target,
         &impostor,
         components(&ecapa, &vad),
@@ -323,11 +369,19 @@ fn a_solo_session_pays_nothing_for_the_turn_boundary_purge() {
     let armed = run_call(
         live_gate(),
         250.0,
+        false,
         &target,
         &target,
         components(&ecapa, &vad),
     );
-    let disabled = run_call(live_gate(), 0.0, &target, &target, components(&ecapa, &vad));
+    let disabled = run_call(
+        live_gate(),
+        0.0,
+        false,
+        &target,
+        &target,
+        components(&ecapa, &vad),
+    );
     eprintln!(
         "solo: {:.1}% survives with the purge configured, {:.1}% with it off",
         100.0 * armed.target,

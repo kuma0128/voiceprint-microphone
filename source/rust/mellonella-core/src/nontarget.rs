@@ -66,13 +66,14 @@
 //! break-even.
 //!
 //! That bound holds only while the threshold this module is handed is
-//! the one the gate actually admits on. It is why
-//! [`crate::gating::GateConfig::other_speaker_margin`] and
-//! `adaptive_theta` must not both be enabled: an adapted threshold can
-//! sink to half the static one, well below the level at which a target
-//! score says anything about who is speaking. Every shipped
-//! configuration that turns the margin on pins `adaptive_theta` to
-//! `false`, and `streaming::score_and_learn_others` debug-asserts it.
+//! the one the gate actually admits on, and while both target and other
+//! scores are raw cosine values. It is why
+//! [`crate::gating::GateConfig::other_speaker_margin`] is incompatible
+//! with `adaptive_theta` and `use_as_norm`: an adapted threshold can
+//! sink below the level at which a target score identifies the speaker,
+//! while AS-Norm changes only the target score to a z-score. Streaming
+//! pipeline construction and live gate updates reject both combinations
+//! before they can reach this module.
 //!
 //! The model is session-scoped: [`OtherSpeakers::reset`] clears it when a
 //! session starts. Persisting it across runs would buy a slightly faster
@@ -118,6 +119,7 @@ pub struct OtherSpeakerConfig {
     /// EMA step for folding a window into the cluster it matched.
     pub eta: f32,
     /// Cluster budget; the least-reinforced one is evicted when full.
+    /// `0` disables learning and clears any pending seed.
     pub max_clusters: usize,
     /// Windows that clear the target threshold but would be blocked by
     /// the same other-speaker cluster before that cluster is forgotten.
@@ -263,7 +265,11 @@ impl OtherSpeakers {
             self.conflict_cluster = Some(idx);
             self.conflict_evidence = CONFLICT_WEIGHT;
         }
-        if self.conflict_evidence < config.conflict_forget_windows.max(1) * CONFLICT_WEIGHT {
+        let forget_at = config
+            .conflict_forget_windows
+            .max(1)
+            .saturating_mul(CONFLICT_WEIGHT);
+        if self.conflict_evidence < forget_at {
             return best.max(0.0);
         }
 
@@ -292,6 +298,11 @@ impl OtherSpeakers {
     ) where
         F: Fn(&[f32]) -> f32,
     {
+        if config.max_clusters == 0 {
+            self.run = 0;
+            self.pending = None;
+            return;
+        }
         if target_score >= theta_pass * config.seed_ceiling_frac {
             self.run = 0;
             self.pending = None;
@@ -489,6 +500,41 @@ mod tests {
             }
         }
         assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn zero_cluster_budget_disables_learning_without_panicking() {
+        let cfg = OtherSpeakerConfig {
+            max_clusters: 0,
+            ..OtherSpeakerConfig::default()
+        };
+        let mut m = OtherSpeakers::new();
+        let profile = |e: &[f32]| cos_similarity(e, &unit(8, 0));
+        for _ in 0..10 {
+            m.observe(&unit(8, 1), 0.10, 0.45, &cfg, profile);
+        }
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn conflict_forget_window_overflow_is_saturated() {
+        let cfg = OtherSpeakerConfig {
+            conflict_forget_windows: u32::MAX,
+            ..OtherSpeakerConfig::default()
+        };
+        let mut m = OtherSpeakers::new();
+        let target = unit(2, 0);
+        let profile = |e: &[f32]| cos_similarity(e, &target);
+        let other = at_target_score(0.30);
+        for _ in 0..3 {
+            m.observe(&other, 0.30, 0.45, &cfg, profile);
+        }
+        assert_eq!(m.len(), 1);
+        // This used to overflow while calculating the forget threshold
+        // in debug builds. One conflict must not remove the cluster.
+        let score = m.score_for_gate(&at_target_score(0.50), 0.50, 0.45, 0.08, &cfg);
+        assert!(score > 0.90);
+        assert_eq!(m.len(), 1);
     }
 
     #[test]

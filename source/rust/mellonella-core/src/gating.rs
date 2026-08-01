@@ -256,6 +256,9 @@ pub struct GateConfig {
     /// Even when enabled the term stays inert until the model has
     /// actually learned somebody, and it only ever learns from audio
     /// this gate is already rejecting — so a solo session never sees it.
+    /// A non-zero margin requires fixed-threshold raw-cosine scoring:
+    /// [`crate::streaming::StreamingPipeline`] rejects it when
+    /// [`Self::adaptive_theta`] or [`Self::use_as_norm`] is enabled.
     pub other_speaker_margin: f32,
     /// Fraction of the pass threshold below which [`Self::hangover_ms`]
     /// stops protecting an open gate.

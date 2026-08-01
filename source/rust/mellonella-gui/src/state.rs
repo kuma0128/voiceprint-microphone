@@ -147,8 +147,8 @@ pub struct AppState {
     /// saved enrollment instead of replacing it: the new anchors are
     /// appended to the existing pools so one profile can hold several
     /// registrations (morning voice, evening voice, …). Scoring takes
-    /// the max over all anchors, so extra registrations only ever help
-    /// recall.
+    /// the max over up to four acoustic-condition means; profiles beyond
+    /// that security cap merge their closest conditions.
     pub pending_append: bool,
     pub session: Option<LiveSession>,
     pub recorder: Option<Recorder>,
@@ -360,9 +360,10 @@ pub fn separator_threshold_path() -> Option<PathBuf> {
 /// backward-compatible and lets a damaged file fall back atomically to
 /// safe defaults: `v2 <threshold> <hangover_ms> <release_ms>`.
 ///
-/// `v2` identifies settings calibrated for max-over-reference identity
+/// `v2` identifies settings calibrated for condition-group identity
 /// scoring. Older thresholds are accepted only after clamping them to the
-/// current safe default; stricter user settings remain intact.
+/// current safe default; v2 thresholds use the current safe floor and
+/// stricter user settings remain intact.
 const GATE_SETTINGS_FORMAT: &str = "v2";
 
 #[must_use]

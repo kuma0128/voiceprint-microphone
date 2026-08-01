@@ -1090,11 +1090,22 @@ pub(crate) struct AsyncWorker {
     result_rx: Receiver<Result<(Vec<f32>, f32), EmbeddingError>>,
     join: Option<JoinHandle<(Fbank, EcapaTdnn)>>,
     outstanding: u32,
-    pending: Option<Vec<f32>>,
+    /// Latest queued window and the frame that produced that exact
+    /// window. Replacing a pending job replaces both together.
+    pending: Option<(Vec<f32>, usize)>,
     refresh_frame_indices: VecDeque<usize>,
 }
 
 impl AsyncWorker {
+    fn start_pending(&mut self) {
+        if let Some((next, frame_idx)) = self.pending.take() {
+            if self.work_tx.send(next).is_ok() {
+                self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
+            }
+        }
+    }
+
     fn spawn(
         mut fbank: Fbank,
         mut ecapa: EcapaTdnn,
@@ -1147,13 +1158,13 @@ impl AsyncWorker {
     /// normal use, but the fallback keeps the state machine well-
     /// defined under burst load).
     fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
-        self.refresh_frame_indices.push_back(frame_idx);
         if self.outstanding == 0 {
             if self.work_tx.send(window).is_ok() {
                 self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
             }
         } else {
-            self.pending = Some(window);
+            self.pending = Some((window, frame_idx));
         }
     }
 
@@ -1163,22 +1174,40 @@ impl AsyncWorker {
             return Ok(None);
         }
         match self.result_rx.try_recv() {
-            Ok(Ok((emb, f0_mu))) => {
-                let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-                self.outstanding -= 1;
-                if let Some(next) = self.pending.take() {
-                    if self.work_tx.send(next).is_ok() {
-                        self.outstanding = 1;
-                    }
-                }
+            Ok(msg) => {
+                let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                    EmbeddingError::Ort("async refresh result lost its trigger frame".into())
+                })?;
+                self.outstanding = 0;
+                self.start_pending();
+                let (emb, f0_mu) = msg?;
                 Ok(Some((frame_idx, emb, f0_mu)))
             }
-            Ok(Err(e)) => Err(e),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 Err(EmbeddingError::Ort("async worker disconnected".into()))
             }
         }
+    }
+
+    /// Discard every job submitted before a public pipeline reset.
+    ///
+    /// One inference may already be executing and cannot be cancelled;
+    /// wait for that single result and throw it away. The queued job is
+    /// dropped immediately. This keeps a previous session from
+    /// repopulating the reset other-speaker model or installing a stale
+    /// trigger frame in the new session.
+    fn discard_pending_and_drain(&mut self) {
+        self.pending = None;
+        while self.outstanding > 0 {
+            if self.result_rx.recv().is_err() {
+                break;
+            }
+            self.outstanding -= 1;
+            self.refresh_frame_indices.pop_front();
+        }
+        self.outstanding = 0;
+        self.refresh_frame_indices.clear();
     }
 
     /// Blocking drain of outstanding work — used by `flush_async`.
@@ -1189,15 +1218,13 @@ impl AsyncWorker {
                 .result_rx
                 .recv()
                 .map_err(|_| EmbeddingError::Ort("async worker disconnected".into()))?;
+            let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                EmbeddingError::Ort("async refresh result lost its trigger frame".into())
+            })?;
+            self.outstanding = 0;
+            self.start_pending();
             let (emb, f0_mu) = msg?;
-            let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-            self.outstanding -= 1;
             results.push((frame_idx, emb, f0_mu));
-            if let Some(next) = self.pending.take() {
-                if self.work_tx.send(next).is_ok() {
-                    self.outstanding = 1;
-                }
-            }
         }
         Ok(results)
     }
@@ -1312,6 +1339,36 @@ struct SyncRefresh<'a> {
     gate_cfg: GateConfig,
 }
 
+/// Validate the score-scale invariants required by the session-scoped
+/// other-speaker model.
+///
+/// The model stores raw cosine centroids and its recovery guard reasons
+/// about the fixed raw-cosine pass threshold. AS-Norm changes the target
+/// score to a z-score; adaptive thresholding changes the admission level
+/// independently of the guard. Either combination would silently compare
+/// unlike quantities and invalidate the lockout-recovery bound.
+fn validate_other_speaker_gate_config(gate: &GateConfig) -> Result<(), PipelineError> {
+    if !gate.other_speaker_margin.is_finite() || gate.other_speaker_margin < 0.0 {
+        return Err(PipelineError::InvalidGateConfig(
+            "other_speaker_margin must be finite and non-negative",
+        ));
+    }
+    if gate.other_speaker_margin == 0.0 {
+        return Ok(());
+    }
+    if gate.adaptive_theta {
+        return Err(PipelineError::InvalidGateConfig(
+            "other_speaker_margin requires adaptive_theta = false",
+        ));
+    }
+    if gate.use_as_norm {
+        return Err(PipelineError::InvalidGateConfig(
+            "other_speaker_margin cannot be combined with AS-Norm scores",
+        ));
+    }
+    Ok(())
+}
+
 /// Score `embedding` against the other speakers heard this session and
 /// fold it into the model. Shared by both refresh strategies.
 ///
@@ -1340,6 +1397,10 @@ fn score_and_learn_others(
     debug_assert!(
         !gate_cfg.adaptive_theta,
         "other_speaker_margin requires a fixed pass threshold; see nontarget's module docs"
+    );
+    debug_assert!(
+        !gate_cfg.use_as_norm,
+        "other_speaker_margin requires raw cosine scores"
     );
     score.last_other = others.score_for_gate(
         embedding,
@@ -1456,7 +1517,7 @@ pub(crate) struct ScopedRefreshChannel {
     work_tx: std::sync::mpsc::Sender<Vec<f32>>,
     result_rx: std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), EmbeddingError>>,
     outstanding: u32,
-    pending: Option<Vec<f32>>,
+    pending: Option<(Vec<f32>, usize)>,
     refresh_frame_indices: VecDeque<usize>,
 }
 
@@ -1473,17 +1534,26 @@ impl ScopedRefreshChannel {
             refresh_frame_indices: VecDeque::new(),
         }
     }
+
+    fn start_pending(&mut self) {
+        if let Some((next, frame_idx)) = self.pending.take() {
+            if self.work_tx.send(next).is_ok() {
+                self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
+            }
+        }
+    }
 }
 
 impl RefreshChannel for ScopedRefreshChannel {
     fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
-        self.refresh_frame_indices.push_back(frame_idx);
         if self.outstanding == 0 {
             if self.work_tx.send(window).is_ok() {
                 self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
             }
         } else {
-            self.pending = Some(window);
+            self.pending = Some((window, frame_idx));
         }
     }
 
@@ -1492,17 +1562,15 @@ impl RefreshChannel for ScopedRefreshChannel {
             return Ok(None);
         }
         match self.result_rx.try_recv() {
-            Ok(Ok((emb, f0_mu))) => {
-                let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-                self.outstanding -= 1;
-                if let Some(next) = self.pending.take() {
-                    if self.work_tx.send(next).is_ok() {
-                        self.outstanding = 1;
-                    }
-                }
+            Ok(msg) => {
+                let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                    EmbeddingError::Ort("scoped refresh result lost its trigger frame".into())
+                })?;
+                self.outstanding = 0;
+                self.start_pending();
+                let (emb, f0_mu) = msg?;
                 Ok(Some((frame_idx, emb, f0_mu)))
             }
-            Ok(Err(e)) => Err(e),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 Err(EmbeddingError::Ort("ECAPA worker disconnected".into()))
@@ -1517,15 +1585,13 @@ impl RefreshChannel for ScopedRefreshChannel {
                 .result_rx
                 .recv()
                 .map_err(|_| EmbeddingError::Ort("ECAPA worker disconnected".into()))?;
+            let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                EmbeddingError::Ort("scoped refresh result lost its trigger frame".into())
+            })?;
+            self.outstanding = 0;
+            self.start_pending();
             let (emb, f0_mu) = msg?;
-            let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-            self.outstanding -= 1;
             results.push((frame_idx, emb, f0_mu));
-            if let Some(next) = self.pending.take() {
-                if self.work_tx.send(next).is_ok() {
-                    self.outstanding = 1;
-                }
-            }
         }
         Ok(results)
     }
@@ -1624,6 +1690,7 @@ impl StreamingState {
     /// async streaming, call [`Self::new_async`] (and route through
     /// [`StreamingPipeline`] which owns the worker lifecycle).
     pub(crate) fn new(config: &StreamingConfig) -> Result<Self, PipelineError> {
+        validate_other_speaker_gate_config(&config.gate)?;
         if config.pipeline.async_refresh {
             return Err(PipelineError::Embedding(EmbeddingError::Ort(
                 "StreamingState::new requires async_refresh = false; \
@@ -1740,6 +1807,9 @@ impl StreamingState {
     /// Reset the carry-over state without touching pool or
     /// components. Used by [`StreamingPipeline::reset`].
     pub(crate) fn reset(&mut self, config: &StreamingConfig) {
+        if let Some(worker) = self.async_worker.as_mut() {
+            worker.discard_pending_and_drain();
+        }
         self.audio_ring.clear();
         if let Some(r) = self.resampler.as_mut() {
             r.reset();
@@ -1763,17 +1833,28 @@ impl StreamingState {
         self.audio_samples_emitted = 0;
         self.fast_f0_cue.reset();
         self.turn.reset(config.pipeline.sv_window_samples);
-        // Stage C, Phase 5: drain the TSE/DFN3 chain accumulators and
-        // the pending-gain queue so a `reset()` is a clean restart
-        // even when neural processing is active.
+        // Stage C, Phase 5: reset every stateful adaptive-chain piece
+        // so a new session never inherits an overlap decision,
+        // hysteresis timer, transition, or recurrent model state.
         if let Some(stage) = self.tse_stage.as_mut() {
             stage.reset();
         }
         if let Some(stream) = self.dfn3_stream.as_mut() {
             stream.reset();
         }
+        if let Some(detector) = self.overlap_detector.as_mut() {
+            detector.reset();
+        }
         self.chain_pending_gain.clear();
         self.chain_pending_raw.clear();
+        self.chain_transition_remaining = 0;
+        self.chain_transition_total = 0;
+        self.chain_transition_prev_makeup_lin = 1.0;
+        self.chain_transition_prev_alpha = 1.0;
+        self.solo_output_rms_ema = 0.0;
+        self.chain_mode = ChainMode::Solo;
+        self.overlap_above_ms = 0.0;
+        self.overlap_below_ms = 0.0;
     }
 
     /// Push a decision-rate frame into the pre-roll lookback ring,
@@ -2908,9 +2989,11 @@ impl StreamingPipeline {
     ///
     /// # Errors
     ///
-    /// Returns `PipelineError` if the resampler can't be built
-    /// (only when `audio_sample_rate != pipeline.sample_rate`), if
-    /// spawning the async worker fails, or — when
+    /// Returns `PipelineError` if the gate configuration combines an
+    /// enabled other-speaker margin with adaptive or AS-Norm scoring,
+    /// if the resampler can't be built (only when
+    /// `audio_sample_rate != pipeline.sample_rate`), if spawning the
+    /// async worker fails, or — when
     /// `config.pipeline.tse.is_some()` — if either the rate check
     /// (`PipelineError::TseRateMismatch`), the async-mode rejection
     /// (`PipelineError::TseAsyncUnsupported`), or the cond-embedding
@@ -2927,6 +3010,7 @@ impl StreamingPipeline {
         config: StreamingConfig,
         mut components: PipelineComponents,
     ) -> Result<Self, PipelineError> {
+        validate_other_speaker_gate_config(&config.gate)?;
         // Stage C, Phase 5 part 3 + Step 4: TSE wiring for streaming.
         // Both sync (`async_refresh=false`) and async
         // (`async_refresh=true`) paths now support TSE. The cond
@@ -3123,10 +3207,18 @@ impl StreamingPipeline {
     /// Apply gate/envelope settings without rebuilding ONNX sessions or
     /// resetting live state. This is safe between `push_samples` calls
     /// (the public API already requires `&mut self`).
-    pub fn set_gate_config(&mut self, gate: GateConfig) {
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::InvalidGateConfig`] when the
+    /// other-speaker margin is combined with adaptive thresholding or
+    /// AS-Norm, or when the margin is not finite/non-negative. The
+    /// existing live configuration is left untouched on error.
+    pub fn set_gate_config(&mut self, gate: GateConfig) -> Result<(), PipelineError> {
+        validate_other_speaker_gate_config(&gate)?;
         self.config.gate = gate;
         self.state.gate_state.set_config(gate);
         self.state.envelope_state.set_config(gate);
+        Ok(())
     }
 
     /// Current gate configuration, including any live updates.
@@ -3147,10 +3239,15 @@ impl StreamingPipeline {
         self.state.gate_state.effective_theta_pass()
     }
 
-    /// Reset stateful pieces (rings, gate, envelope, frame index)
-    /// **without** rebuilding ONNX sessions or tearing down the
-    /// async worker thread (if any). Pool is preserved.
+    /// Reset stateful pieces (VAD, rings, gate, envelope, neural
+    /// streams, overlap routing, frame index and queued async results)
+    /// **without** rebuilding ONNX sessions or tearing down the async
+    /// worker thread (if any). Pool is preserved.
     pub fn reset(&mut self) {
+        match &mut self.components {
+            ComponentsStorage::Sync(components) => components.vad.reset(),
+            ComponentsStorage::Async { vad, .. } => vad.reset(),
+        }
         self.state.reset(&self.config);
     }
 
@@ -3390,6 +3487,32 @@ mod tests {
             .chain_pending_raw
             .extend(std::iter::repeat(0.0).take(n));
         (state, cfg)
+    }
+
+    #[test]
+    fn reset_clears_adaptive_chain_routing_state() {
+        let (mut state, cfg) = state_with_pending_chain_samples(8);
+        state.chain_transition_remaining = 7;
+        state.chain_transition_total = 9;
+        state.chain_transition_prev_makeup_lin = 1.7;
+        state.chain_transition_prev_alpha = 0.4;
+        state.solo_output_rms_ema = 0.25;
+        state.chain_mode = ChainMode::Overlap;
+        state.overlap_above_ms = 500.0;
+        state.overlap_below_ms = 250.0;
+
+        state.reset(&cfg);
+
+        assert!(state.chain_pending_gain.is_empty());
+        assert!(state.chain_pending_raw.is_empty());
+        assert_eq!(state.chain_transition_remaining, 0);
+        assert_eq!(state.chain_transition_total, 0);
+        assert_eq!(state.chain_transition_prev_makeup_lin, 1.0);
+        assert_eq!(state.chain_transition_prev_alpha, 1.0);
+        assert_eq!(state.solo_output_rms_ema, 0.0);
+        assert_eq!(state.chain_mode, ChainMode::Solo);
+        assert_eq!(state.overlap_above_ms, 0.0);
+        assert_eq!(state.overlap_below_ms, 0.0);
     }
 
     #[test]
@@ -3811,6 +3934,134 @@ mod tests {
         }
         assert_eq!(edges, 1, "due_turn must fire exactly once per turn");
         assert_eq!(det.state, TurnState::Shrunk);
+    }
+
+    #[test]
+    fn scoped_refresh_overwrite_keeps_window_and_trigger_together() {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+        let mut channel = ScopedRefreshChannel::new(work_tx, result_rx);
+
+        channel.submit(vec![1.0], 10);
+        channel.submit(vec![2.0], 20);
+        channel.submit(vec![3.0], 30); // replaces the entire pending job
+        assert_eq!(work_rx.recv().unwrap(), vec![1.0]);
+
+        result_tx.send(Ok((vec![101.0], 1.0))).unwrap();
+        let first = channel.try_recv_result().unwrap().unwrap();
+        assert_eq!(first.0, 10);
+        assert_eq!(work_rx.recv().unwrap(), vec![3.0]);
+
+        result_tx.send(Ok((vec![103.0], 3.0))).unwrap();
+        let latest = channel.try_recv_result().unwrap().unwrap();
+        assert_eq!(latest.0, 30, "overwritten frame 20 must not survive");
+        assert_eq!(latest.1, vec![103.0]);
+        assert_eq!(channel.outstanding, 0);
+        assert!(channel.refresh_frame_indices.is_empty());
+    }
+
+    #[test]
+    fn scoped_refresh_error_still_advances_the_pending_job() {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+        let mut channel = ScopedRefreshChannel::new(work_tx, result_rx);
+        channel.submit(vec![1.0], 10);
+        channel.submit(vec![2.0], 20);
+        assert_eq!(work_rx.recv().unwrap(), vec![1.0]);
+
+        result_tx
+            .send(Err(EmbeddingError::Ort("synthetic".into())))
+            .unwrap();
+        assert!(channel.try_recv_result().is_err());
+        assert_eq!(work_rx.recv().unwrap(), vec![2.0]);
+
+        result_tx.send(Ok((vec![102.0], 2.0))).unwrap();
+        let second = channel.try_recv_result().unwrap().unwrap();
+        assert_eq!(second.0, 20);
+        assert_eq!(channel.outstanding, 0);
+    }
+
+    #[test]
+    fn async_worker_reset_discards_completed_and_pending_old_jobs() {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+        let mut worker = AsyncWorker {
+            work_tx,
+            result_rx,
+            join: None,
+            outstanding: 0,
+            pending: None,
+            refresh_frame_indices: VecDeque::new(),
+        };
+
+        worker.submit(vec![1.0], 10);
+        worker.submit(vec![2.0], 20);
+        assert_eq!(work_rx.recv().unwrap(), vec![1.0]);
+        result_tx.send(Ok((vec![101.0], 1.0))).unwrap();
+
+        // The first result is complete but unpolled, and the second job
+        // is still queued. A session reset must discard both without
+        // dispatching the pending job.
+        worker.discard_pending_and_drain();
+        assert_eq!(worker.outstanding, 0);
+        assert!(worker.pending.is_none());
+        assert!(worker.refresh_frame_indices.is_empty());
+        assert!(matches!(
+            work_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        // The channel remains usable, and a new-session job keeps its
+        // own trigger frame rather than inheriting frame 10 or 20.
+        worker.submit(vec![3.0], 30);
+        assert_eq!(work_rx.recv().unwrap(), vec![3.0]);
+        result_tx.send(Ok((vec![103.0], 3.0))).unwrap();
+        let fresh = worker.try_recv_result().unwrap().unwrap();
+        assert_eq!(fresh.0, 30);
+        assert_eq!(fresh.1, vec![103.0]);
+    }
+
+    #[test]
+    fn other_speaker_margin_rejects_incompatible_score_modes() {
+        let fixed = GateConfig {
+            theta_pass: 0.45,
+            adaptive_theta: false,
+            other_speaker_margin: 0.08,
+            ..GateConfig::default()
+        };
+        assert!(validate_other_speaker_gate_config(&fixed).is_ok());
+
+        let adaptive = GateConfig {
+            adaptive_theta: true,
+            ..fixed
+        };
+        assert!(matches!(
+            validate_other_speaker_gate_config(&adaptive),
+            Err(PipelineError::InvalidGateConfig(_))
+        ));
+
+        let as_norm = GateConfig {
+            use_as_norm: true,
+            ..fixed
+        };
+        assert!(matches!(
+            validate_other_speaker_gate_config(&as_norm),
+            Err(PipelineError::InvalidGateConfig(_))
+        ));
+
+        for margin in [f32::NAN, f32::INFINITY, -0.1] {
+            let invalid = GateConfig {
+                other_speaker_margin: margin,
+                ..fixed
+            };
+            assert!(matches!(
+                validate_other_speaker_gate_config(&invalid),
+                Err(PipelineError::InvalidGateConfig(_))
+            ));
+        }
     }
 
     #[test]

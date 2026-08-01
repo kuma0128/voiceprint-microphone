@@ -135,8 +135,8 @@ pub const MIN_ANCHORS_PER_GROUP: usize = 4;
 ///
 /// Measured intra-session anchor similarity is mean 0.85 / p10 0.80, so
 /// 0.70 merges windows of one recording while leaving a genuinely
-/// separate registration standing on its own — which is what keeps the
-/// `+声紋を追加登録` contract ("another registration can only help") true.
+/// separate registration standing on its own while the profile remains
+/// within the four-condition hard cap.
 pub const CONDITION_MERGE_COS: f32 = 0.70;
 
 /// Element-wise mean of `vectors`, or `None` for an empty slice.
@@ -174,11 +174,13 @@ fn elementwise_mean(vectors: &[Vec<f32>]) -> Option<Vec<f32>> {
 ///   [`MAX_CONDITION_GROUPS`] — forces the windows of one recording to
 ///   collapse into a few averaged means, which is what removes the
 ///   per-anchor lottery an impostor otherwise wins on one noisy window.
-/// * **[`CONDITION_MERGE_COS`]** stops the budget from steamrollering a
-///   genuinely separate registration into the average of another one.
-///   Two anchors from different acoustic conditions stay apart even at a
-///   budget of 1, so an extra `+声紋を追加登録` can still only ever raise
-///   the enrolled speaker's recall.
+/// * **[`CONDITION_MERGE_COS`]** stops the *soft* budget from
+///   steamrollering a genuinely separate registration into the average
+///   of another one. The floor is waived only while more than
+///   [`MAX_CONDITION_GROUPS`] groups remain: the hard cap is the security
+///   property that prevents a noisy but still accepted enrollment from
+///   recreating the raw-anchor lottery. Profiles with four or fewer
+///   distinct conditions keep those conditions separate.
 ///
 /// A single-anchor pool yields that anchor verbatim, so
 /// [`EmbeddingPool::match_score`] stays exactly `cos(emb, anchor)`.
@@ -200,7 +202,13 @@ fn condition_groups(anchors: &[Vec<f32>]) -> Vec<Vec<f32>> {
             }
         }
         let (i, j, similarity) = best;
-        if similarity < CONDITION_MERGE_COS {
+        // Honour the acoustic-condition boundary once the hard security
+        // cap has been reached. Before that point we must keep merging:
+        // an enrollment with twelve mutually 0.60-similar anchors is
+        // accepted by the GUI's 0.40 consistency floor, but leaving all
+        // twelve separate would recreate the exact per-anchor lottery
+        // this grouping exists to remove.
+        if similarity < CONDITION_MERGE_COS && groups.len() <= MAX_CONDITION_GROUPS {
             break;
         }
         let merged = groups.remove(j);
@@ -208,6 +216,7 @@ fn condition_groups(anchors: &[Vec<f32>]) -> Vec<Vec<f32>> {
         groups[i].extend(merged);
         means[i] = elementwise_mean(&groups[i]).expect("non-empty group");
     }
+    debug_assert!(groups.len() <= MAX_CONDITION_GROUPS);
     means
 }
 
@@ -318,9 +327,10 @@ impl EmbeddingPool {
     ///   extra registrations added via `+声紋を追加登録`). Those conditions
     ///   sit in *different* directions in embedding space, so averaging
     ///   them all into one vector scores every one of them worse than
-    ///   itself. Taking the max over conditions means an extra
-    ///   registration can only ever raise the enrolled speaker's recall,
-    ///   which is the contract the UI advertises.
+    ///   itself. Taking the max over the retained conditions preserves
+    ///   distinct registrations without averaging all of them into one;
+    ///   profiles beyond the four-condition security cap compress the
+    ///   closest conditions together.
     /// * **averaging inside a condition** — the max runs over
     ///   [`condition_groups`] means, *not* over raw anchors. A raw-anchor
     ///   max hands an unrelated speaker one lottery ticket per anchor,
@@ -681,13 +691,13 @@ mod tests {
     }
 
     #[test]
-    fn match_score_takes_best_anchor_over_centroid() {
+    fn match_score_takes_best_condition_over_centroid() {
         // Two anchors pointing in different directions (the shape a
         // multi-condition profile has: morning voice + evening voice).
         // Their centroid sits on the
         // bisector and matches *neither* well. A probe equal to one
-        // anchor must score ~1.0 — adding a second registration can only
-        // raise the enrolled speaker's recall, never lower it.
+        // anchor must score ~1.0 because two conditions fit below the
+        // hard cap and are retained separately.
         let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
         let a = unit(&[1.0, 1.0, 0.0]);
         let b = unit(&[1.0, -1.0, 0.0]);
@@ -698,7 +708,7 @@ mod tests {
         assert!((score - 1.0).abs() < 1e-6, "score={score}");
         assert!(
             score > centroid_score,
-            "per-anchor max {score} must beat the centroid {centroid_score}"
+            "per-condition max {score} must beat the centroid {centroid_score}"
         );
     }
 
@@ -725,6 +735,44 @@ mod tests {
             pool.condition_centroids().len()
         );
         assert!(!pool.condition_centroids().is_empty());
+    }
+
+    #[test]
+    fn accepted_but_variable_enrollment_still_obeys_the_hard_group_cap() {
+        // Every pair has cosine 0.60: comfortably above the GUI's 0.40
+        // enrollment-consistency floor, but below CONDITION_MERGE_COS.
+        // The old early break left all twelve as lottery tickets.
+        let common = 0.60_f32.sqrt();
+        let unique = 0.40_f32.sqrt();
+        let anchors: Vec<Vec<f32>> = (0..12)
+            .map(|i| {
+                let mut v = vec![0.0_f32; 13];
+                v[0] = common;
+                v[i + 1] = unique;
+                v
+            })
+            .collect();
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        pool.add_anchors(anchors);
+        assert!(
+            (1..=MAX_CONDITION_GROUPS).contains(&pool.condition_centroids().len()),
+            "accepted enrollment must collapse to the hard cap, got {} groups",
+            pool.condition_centroids().len()
+        );
+    }
+
+    #[test]
+    fn hard_group_cap_wins_over_many_distinct_registrations() {
+        let mut pool = EmbeddingPool::new(EmbeddingPoolConfig::default());
+        let anchors: Vec<Vec<f32>> = (0..8)
+            .map(|axis| {
+                let mut v = vec![0.0_f32; 8];
+                v[axis] = 1.0;
+                v
+            })
+            .collect();
+        pool.add_anchors(anchors);
+        assert_eq!(pool.condition_centroids().len(), MAX_CONDITION_GROUPS);
     }
 
     #[test]

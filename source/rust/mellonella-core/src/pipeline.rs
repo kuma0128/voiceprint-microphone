@@ -544,6 +544,9 @@ pub enum PipelineError {
     /// follow-up; sync `process_offline` is the only supported path
     /// for now.
     TseAsyncUnsupported,
+    /// A streaming gate configuration combines features whose scores
+    /// are not on a compatible scale.
+    InvalidGateConfig(&'static str),
 }
 
 impl std::fmt::Display for PipelineError {
@@ -573,6 +576,7 @@ impl std::fmt::Display for PipelineError {
                 "Stage C TSE with async_refresh = true is not yet \
                  wired up — use the sync offline path"
             ),
+            Self::InvalidGateConfig(message) => write!(f, "invalid gate configuration: {message}"),
         }
     }
 }
@@ -584,7 +588,8 @@ impl std::error::Error for PipelineError {
             Self::Envelope(_)
             | Self::TseRateMismatch { .. }
             | Self::TseMissingEnrollment
-            | Self::TseAsyncUnsupported => None,
+            | Self::TseAsyncUnsupported
+            | Self::InvalidGateConfig(_) => None,
             Self::Resample(e) => Some(e),
             Self::TseStage(e) => Some(e),
         }
