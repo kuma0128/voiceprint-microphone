@@ -149,6 +149,59 @@ pub struct PipelineConfig {
     /// (~250 ms) so normal speech doesn't trip the hangover; values
     /// below ~200 ms flicker on natural mid-sentence breath.
     pub silence_force_off_ms: f32,
+    /// Silence duration (ms) after which the accumulated identity window
+    /// is **discarded** and the gate held shut until a refresh has run
+    /// on speech collected entirely after the gap. `0.0` disables it.
+    ///
+    /// This is the defence against the dominant leak in a two-person
+    /// conversation, which is not a scoring failure. `speech_buffer`
+    /// accumulates VAD-speech frames and is never cleared, so for about
+    /// a second after the speaker changes the identity window holds a
+    /// blend of both voices and its score describes neither. Measured on
+    /// a same-sex pair taking 4 s turns: ~90 % of the new speaker's first
+    /// 250 ms passes the gate and the leak only dies out after ~1.2 s.
+    /// Steady state is not involved — from 1.5 s into a turn that same
+    /// impostor is already rejected completely.
+    ///
+    /// A turn change almost always happens across a pause, so the pause
+    /// is the cue — and the threshold must sit **below** the gaps you
+    /// want to catch, not above them. Measured with 4 s turns: at 250 ms
+    /// the impostor's leak falls to 0.7 % for 500 ms turn gaps and 4.8 %
+    /// for 300 ms ones; raising it to 300 ms leaves 300 ms gaps
+    /// completely uncovered (28.8 %) while costing the enrolled speaker
+    /// exactly as much. Lower is therefore strictly better here, down to
+    /// the point where it fires inside a single word.
+    ///
+    /// The cost is bounded two ways. The purge only arms once
+    /// [`crate::nontarget::OtherSpeakers`] has actually heard a second
+    /// person, so a solo session is untouched (measured identical to
+    /// disabling this outright). And re-opening uses the shorter
+    /// [`Self::sv_reopen_window_samples`], so the enrolled speaker waits
+    /// ~0.5 s rather than a full window.
+    ///
+    /// That first bound means this setting **depends on
+    /// [`crate::gating::GateConfig::other_speaker_margin`] being
+    /// non-zero** — that is what maintains the other-speaker model. With
+    /// the margin at `0.0` nobody is ever learned, so this never arms
+    /// and setting it has no effect at all.
+    ///
+    /// Default `0.0` — unchanged library behaviour, and the offline
+    /// parity fixtures are unaffected.
+    pub turn_boundary_silence_ms: f32,
+    /// Identity-window length used only while re-qualifying after a
+    /// [`Self::turn_boundary_silence_ms`] purge, in samples.
+    ///
+    /// The gate is shut for this whole period, so every sample of it is
+    /// dead air for the enrolled speaker — which is the entire cost of
+    /// the purge. A shorter window than [`Self::sv_window_samples`]
+    /// halves that cost, and measurement says it can afford to: scored
+    /// against the profile's condition centroids (not raw anchors), a
+    /// 500 ms window puts the enrolled speaker's median at 0.580 while
+    /// an unrelated same-sex speaker's 95th percentile is 0.366.
+    ///
+    /// Clamped to at most `sv_window_samples`. Ignored when
+    /// `turn_boundary_silence_ms` is `0.0`.
+    pub sv_reopen_window_samples: usize,
     /// EMA smoothing factor applied to `last_score` on every refresh:
     /// `last_score = alpha * new_score + (1 - alpha) * last_score`.
     /// `1.0` disables smoothing — the new score replaces the old one.
@@ -280,6 +333,8 @@ impl Default for PipelineConfig {
             pre_roll_ms: 100,
             async_refresh: false,
             silence_force_off_ms: 0.0,
+            turn_boundary_silence_ms: 0.0,
+            sv_reopen_window_samples: 8_000,
             score_ema_alpha: 0.8,
             // Stage B — all opt-in, default OFF so behaviour (and the
             // `pipeline_parity` byte-equal contract) is unchanged.
@@ -386,6 +441,22 @@ pub(crate) struct ScoreState {
     pub last_cs: f32,
     /// Last refresh's F0 match (diagnostics only).
     pub last_fm: f32,
+    /// Last refresh's best match against the other speakers heard this
+    /// session ([`crate::nontarget::OtherSpeakers`]). `0.0` when none
+    /// are known, which makes the gate's margin test a no-op.
+    pub last_other: f32,
+    /// VAD-frame index at which the most recently *applied* refresh was
+    /// triggered. Lets the streaming engine tell a score computed from
+    /// a post-speaker-change window apart from one that was already in
+    /// flight when the change was detected.
+    pub last_applied_trigger_frame: Option<usize>,
+    /// `true` once [`crate::nontarget::OtherSpeakers`] has actually
+    /// learned somebody — i.e. there is positive evidence that more than
+    /// one person is being heard this session.
+    ///
+    /// The turn-boundary purge keys off this so a genuinely solo session
+    /// pays nothing for it.
+    pub others_known: bool,
 }
 
 impl ScoreState {
@@ -397,6 +468,9 @@ impl ScoreState {
             last_score: 0.0,
             last_cs: 0.0,
             last_fm: 1.0,
+            last_other: 0.0,
+            last_applied_trigger_frame: None,
+            others_known: false,
         }
     }
 }
@@ -470,6 +544,9 @@ pub enum PipelineError {
     /// follow-up; sync `process_offline` is the only supported path
     /// for now.
     TseAsyncUnsupported,
+    /// A streaming gate configuration combines features whose scores
+    /// are not on a compatible scale.
+    InvalidGateConfig(&'static str),
 }
 
 impl std::fmt::Display for PipelineError {
@@ -499,6 +576,7 @@ impl std::fmt::Display for PipelineError {
                 "Stage C TSE with async_refresh = true is not yet \
                  wired up — use the sync offline path"
             ),
+            Self::InvalidGateConfig(message) => write!(f, "invalid gate configuration: {message}"),
         }
     }
 }
@@ -510,7 +588,8 @@ impl std::error::Error for PipelineError {
             Self::Envelope(_)
             | Self::TseRateMismatch { .. }
             | Self::TseMissingEnrollment
-            | Self::TseAsyncUnsupported => None,
+            | Self::TseAsyncUnsupported
+            | Self::InvalidGateConfig(_) => None,
             Self::Resample(e) => Some(e),
             Self::TseStage(e) => Some(e),
         }
@@ -1024,6 +1103,13 @@ fn process_offline_async(
         // cadence is byte-identical.
         let mut channel = ScopedRefreshChannel::new(work_tx, res_rx);
 
+        // The offline path keeps no other-speaker model: `gate_cfg`
+        // defaults to `other_speaker_margin = 0.0`, which makes every
+        // access to this a no-op and preserves the byte-equal parity
+        // contract against the Python reference.
+        let mut others = crate::nontarget::OtherSpeakers::new();
+        let other_cfg = crate::nontarget::OtherSpeakerConfig::default();
+
         let mut frame_start = 0_usize;
         while frame_start + vad_frame <= audio_dec.len() {
             let frame = &audio_dec[frame_start..frame_start + vad_frame];
@@ -1031,6 +1117,8 @@ fn process_offline_async(
                 channel: &mut channel,
                 cohort,
                 pool,
+                others: &mut others,
+                other_cfg,
                 enable_auto_learn: pipeline_cfg.enable_auto_learn,
                 score_ema_alpha: pipeline_cfg.score_ema_alpha,
                 gate_cfg: *gate_cfg,
@@ -1126,6 +1214,7 @@ pub(crate) fn apply_refresh_result(
     let fm = f0_match(f0_mu, pool.metadata().f0_mu, pool.metadata().f0_sigma);
     score.last_cs = cs;
     score.last_fm = fm;
+    score.last_applied_trigger_frame = Some(trigger_frame);
     let new_score = if gate_cfg.use_as_norm && !cohort.is_empty() {
         as_norm_score(&embedding, cs, cohort, 20)
     } else {

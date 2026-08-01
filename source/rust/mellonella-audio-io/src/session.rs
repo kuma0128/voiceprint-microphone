@@ -793,7 +793,7 @@ fn forward_pipeline_audio(
         // Preserve non-UI gate fields (attack, scoring mode, learning
         // guards) and replace only the controls surfaced to the user.
         let gate = tuning.apply_to(pipeline.gate_config());
-        pipeline.set_gate_config(gate);
+        pipeline.set_gate_config(gate).map_err(|e| e.to_string())?;
     }
     let out = pipeline.push_samples(audio).map_err(|e| e.to_string())?;
     if let Some(tuning) = gate_tuning {

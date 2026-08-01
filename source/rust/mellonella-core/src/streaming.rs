@@ -109,6 +109,7 @@ use crate::features::{Fbank, N_MELS};
 use crate::gating::{
     as_norm_score, f0_match, should_admit_auto_learn, EnvelopeState, GateConfig, GateState,
 };
+use crate::nontarget::{OtherSpeakerConfig, OtherSpeakers};
 use crate::pipeline::{
     apply_refresh_result, fbank_ecapa_one, smooth_score, tse_cond_embedding, AutoLearnEvent,
     AutoLearnKind, PipelineComponents, PipelineConfig, PipelineError, ScoreState,
@@ -137,6 +138,12 @@ pub struct StreamingConfig {
     /// Gate-side parameters (hangover, attack/release, score
     /// threshold, F0 weight).
     pub gate: GateConfig,
+    /// Tuning for the session-scoped model of the *other* speakers
+    /// heard during the run. Only consulted when
+    /// [`GateConfig::other_speaker_margin`] is non-zero — see
+    /// [`crate::nontarget`] for why the margin separates a same-sex
+    /// friend that a bare threshold cannot.
+    pub other_speakers: OtherSpeakerConfig,
     /// Sample rate of the audio path — the rate the caller pushes
     /// into [`StreamingPipeline::push_samples`] and the rate the
     /// returned envelope-gated audio is at. Default 48 000 Hz
@@ -339,6 +346,7 @@ impl Default for StreamingConfig {
         Self {
             pipeline: PipelineConfig::default(),
             gate: GateConfig::default(),
+            other_speakers: OtherSpeakerConfig::default(),
             audio_sample_rate: 48_000,
             diagnostics: false,
             dfn3_onnx_path: None,
@@ -865,6 +873,25 @@ pub(crate) struct StreamingState {
     /// (DFN3-denoised) silence and the gate would otherwise stay open
     /// indefinitely on whatever the last refresh scored.
     silence_ms_since_speech: f32,
+    /// `Some(frame_idx)` from the moment the segmentation detector saw
+    /// the speaker change inside its window until an identity refresh
+    /// *triggered at or after that frame* has been applied. While set,
+    /// the gate fails closed: the ECAPA window is a blend of two voices
+    /// and its score describes neither of them.
+    ///
+    /// Keyed on the trigger frame rather than a bare flag because the
+    /// async path can have a refresh in flight across the purge, and
+    /// that result was computed from the pre-change window — letting it
+    /// clear the flag would re-open the gate on exactly the stale score
+    /// this exists to suppress.
+    awaiting_fresh_identity: Option<usize>,
+    /// Session-scoped model of the other people heard during this run.
+    /// Populated only from identity windows the gate has already
+    /// rejected, and only when `GateConfig::other_speaker_margin > 0`.
+    /// Taken out for the duration of a frame step so a refresh strategy
+    /// can hold `&mut` to it disjointly from `&mut self` — the same
+    /// pattern [`Self::async_worker`] uses.
+    others: OtherSpeakers,
     gate_state: GateState,
     envelope_state: EnvelopeState,
     /// Last emitted `(start_sample, is_on)` decision (at audio
@@ -1019,6 +1046,10 @@ fn speech_held_open(now_speech: bool, silence_ms_since_speech: f32, hangover_ms:
 /// second: audible as chopped, gargling speech exactly during the
 /// two-speaker passages this branch exists to serve. The score-gated
 /// branch gets its smoothing from [`GateState`]'s own hangover.
+/// `change_forced_off` is the speaker-change fail-closed term. It
+/// overrides **every** branch including the overlap bypass: while the
+/// identity window is still a blend of two voices, "somebody is
+/// speaking" is not evidence that the enrolled speaker is.
 #[allow(clippy::fn_params_excessive_bools)]
 fn final_gate_decision(
     adaptive: bool,
@@ -1028,7 +1059,11 @@ fn final_gate_decision(
     is_on_score: bool,
     silence_forced_off: bool,
     turn_forced_off: bool,
+    change_forced_off: bool,
 ) -> bool {
+    if change_forced_off {
+        return false;
+    }
     if adaptive && chain_mode == ChainMode::Overlap && overlap_bypass_speaker_gate {
         speech_with_hangover && !silence_forced_off
     } else {
@@ -1055,11 +1090,22 @@ pub(crate) struct AsyncWorker {
     result_rx: Receiver<Result<(Vec<f32>, f32), EmbeddingError>>,
     join: Option<JoinHandle<(Fbank, EcapaTdnn)>>,
     outstanding: u32,
-    pending: Option<Vec<f32>>,
+    /// Latest queued window and the frame that produced that exact
+    /// window. Replacing a pending job replaces both together.
+    pending: Option<(Vec<f32>, usize)>,
     refresh_frame_indices: VecDeque<usize>,
 }
 
 impl AsyncWorker {
+    fn start_pending(&mut self) {
+        if let Some((next, frame_idx)) = self.pending.take() {
+            if self.work_tx.send(next).is_ok() {
+                self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
+            }
+        }
+    }
+
     fn spawn(
         mut fbank: Fbank,
         mut ecapa: EcapaTdnn,
@@ -1112,13 +1158,13 @@ impl AsyncWorker {
     /// normal use, but the fallback keeps the state machine well-
     /// defined under burst load).
     fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
-        self.refresh_frame_indices.push_back(frame_idx);
         if self.outstanding == 0 {
             if self.work_tx.send(window).is_ok() {
                 self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
             }
         } else {
-            self.pending = Some(window);
+            self.pending = Some((window, frame_idx));
         }
     }
 
@@ -1128,22 +1174,40 @@ impl AsyncWorker {
             return Ok(None);
         }
         match self.result_rx.try_recv() {
-            Ok(Ok((emb, f0_mu))) => {
-                let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-                self.outstanding -= 1;
-                if let Some(next) = self.pending.take() {
-                    if self.work_tx.send(next).is_ok() {
-                        self.outstanding = 1;
-                    }
-                }
+            Ok(msg) => {
+                let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                    EmbeddingError::Ort("async refresh result lost its trigger frame".into())
+                })?;
+                self.outstanding = 0;
+                self.start_pending();
+                let (emb, f0_mu) = msg?;
                 Ok(Some((frame_idx, emb, f0_mu)))
             }
-            Ok(Err(e)) => Err(e),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 Err(EmbeddingError::Ort("async worker disconnected".into()))
             }
         }
+    }
+
+    /// Discard every job submitted before a public pipeline reset.
+    ///
+    /// One inference may already be executing and cannot be cancelled;
+    /// wait for that single result and throw it away. The queued job is
+    /// dropped immediately. This keeps a previous session from
+    /// repopulating the reset other-speaker model or installing a stale
+    /// trigger frame in the new session.
+    fn discard_pending_and_drain(&mut self) {
+        self.pending = None;
+        while self.outstanding > 0 {
+            if self.result_rx.recv().is_err() {
+                break;
+            }
+            self.outstanding -= 1;
+            self.refresh_frame_indices.pop_front();
+        }
+        self.outstanding = 0;
+        self.refresh_frame_indices.clear();
     }
 
     /// Blocking drain of outstanding work — used by `flush_async`.
@@ -1154,15 +1218,13 @@ impl AsyncWorker {
                 .result_rx
                 .recv()
                 .map_err(|_| EmbeddingError::Ort("async worker disconnected".into()))?;
+            let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                EmbeddingError::Ort("async refresh result lost its trigger frame".into())
+            })?;
+            self.outstanding = 0;
+            self.start_pending();
             let (emb, f0_mu) = msg?;
-            let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-            self.outstanding -= 1;
             results.push((frame_idx, emb, f0_mu));
-            if let Some(next) = self.pending.take() {
-                if self.work_tx.send(next).is_ok() {
-                    self.outstanding = 1;
-                }
-            }
         }
         Ok(results)
     }
@@ -1268,11 +1330,93 @@ struct SyncRefresh<'a> {
     ecapa: &'a mut EcapaTdnn,
     cohort: &'a [Vec<f32>],
     pool: &'a mut EmbeddingPool,
+    others: &'a mut OtherSpeakers,
+    other_cfg: OtherSpeakerConfig,
     decision_sr: u32,
     enable_auto_learn: bool,
     score_ema_alpha: f32,
     use_as_norm: bool,
     gate_cfg: GateConfig,
+}
+
+/// Validate the score-scale invariants required by the session-scoped
+/// other-speaker model.
+///
+/// The model stores raw cosine centroids and its recovery guard reasons
+/// about the fixed raw-cosine pass threshold. AS-Norm changes the target
+/// score to a z-score; adaptive thresholding changes the admission level
+/// independently of the guard. Either combination would silently compare
+/// unlike quantities and invalidate the lockout-recovery bound.
+fn validate_other_speaker_gate_config(gate: &GateConfig) -> Result<(), PipelineError> {
+    if !gate.other_speaker_margin.is_finite() || gate.other_speaker_margin < 0.0 {
+        return Err(PipelineError::InvalidGateConfig(
+            "other_speaker_margin must be finite and non-negative",
+        ));
+    }
+    if gate.other_speaker_margin == 0.0 {
+        return Ok(());
+    }
+    if gate.adaptive_theta {
+        return Err(PipelineError::InvalidGateConfig(
+            "other_speaker_margin requires adaptive_theta = false",
+        ));
+    }
+    if gate.use_as_norm {
+        return Err(PipelineError::InvalidGateConfig(
+            "other_speaker_margin cannot be combined with AS-Norm scores",
+        ));
+    }
+    Ok(())
+}
+
+/// Score `embedding` against the other speakers heard this session and
+/// fold it into the model. Shared by both refresh strategies.
+///
+/// Order matters: the score is taken **before** the window is learned,
+/// so a window can never be compared against a cluster it just created.
+fn score_and_learn_others(
+    embedding: &[f32],
+    target_score: f32,
+    pool: &EmbeddingPool,
+    others: &mut OtherSpeakers,
+    gate_cfg: &GateConfig,
+    other_cfg: &OtherSpeakerConfig,
+    score: &mut ScoreState,
+) {
+    if gate_cfg.other_speaker_margin <= 0.0 {
+        score.last_other = 0.0;
+        score.others_known = false;
+        return;
+    }
+    // The other-speaker model reasons about `theta_pass` as the level at
+    // which a target score vouches for the enrolled speaker — that is
+    // what stops a mislearned cluster locking its owner out. An adapted
+    // threshold admits at up to half that, well below the level where
+    // the score means anything, so the two features are incompatible.
+    // Every shipped configuration that sets the margin disables it.
+    debug_assert!(
+        !gate_cfg.adaptive_theta,
+        "other_speaker_margin requires a fixed pass threshold; see nontarget's module docs"
+    );
+    debug_assert!(
+        !gate_cfg.use_as_norm,
+        "other_speaker_margin requires raw cosine scores"
+    );
+    score.last_other = others.score_for_gate(
+        embedding,
+        target_score,
+        gate_cfg.theta_pass,
+        gate_cfg.other_speaker_margin,
+        other_cfg,
+    );
+    others.observe(
+        embedding,
+        target_score,
+        gate_cfg.theta_pass,
+        other_cfg,
+        |candidate| pool.match_score(candidate),
+    );
+    score.others_known = !others.is_empty();
 }
 
 impl RefreshStrategy for SyncRefresh<'_> {
@@ -1306,12 +1450,22 @@ impl RefreshStrategy for SyncRefresh<'_> {
         );
         score.last_cs = cs;
         score.last_fm = fm;
+        score.last_applied_trigger_frame = Some(frame_idx);
         let new_score = if self.use_as_norm && !self.cohort.is_empty() {
             as_norm_score(&embedding, cs, self.cohort, 20)
         } else {
             cs
         };
         score.last_score = smooth_score(score.last_score, new_score, self.score_ema_alpha);
+        score_and_learn_others(
+            &embedding,
+            cs,
+            self.pool,
+            self.others,
+            &self.gate_cfg,
+            &self.other_cfg,
+            score,
+        );
 
         if self.enable_auto_learn
             && should_admit_auto_learn(score.last_score, fm, consecutive_speech_ms, &self.gate_cfg)
@@ -1363,7 +1517,7 @@ pub(crate) struct ScopedRefreshChannel {
     work_tx: std::sync::mpsc::Sender<Vec<f32>>,
     result_rx: std::sync::mpsc::Receiver<Result<(Vec<f32>, f32), EmbeddingError>>,
     outstanding: u32,
-    pending: Option<Vec<f32>>,
+    pending: Option<(Vec<f32>, usize)>,
     refresh_frame_indices: VecDeque<usize>,
 }
 
@@ -1380,17 +1534,26 @@ impl ScopedRefreshChannel {
             refresh_frame_indices: VecDeque::new(),
         }
     }
+
+    fn start_pending(&mut self) {
+        if let Some((next, frame_idx)) = self.pending.take() {
+            if self.work_tx.send(next).is_ok() {
+                self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
+            }
+        }
+    }
 }
 
 impl RefreshChannel for ScopedRefreshChannel {
     fn submit(&mut self, window: Vec<f32>, frame_idx: usize) {
-        self.refresh_frame_indices.push_back(frame_idx);
         if self.outstanding == 0 {
             if self.work_tx.send(window).is_ok() {
                 self.outstanding = 1;
+                self.refresh_frame_indices.push_back(frame_idx);
             }
         } else {
-            self.pending = Some(window);
+            self.pending = Some((window, frame_idx));
         }
     }
 
@@ -1399,17 +1562,15 @@ impl RefreshChannel for ScopedRefreshChannel {
             return Ok(None);
         }
         match self.result_rx.try_recv() {
-            Ok(Ok((emb, f0_mu))) => {
-                let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-                self.outstanding -= 1;
-                if let Some(next) = self.pending.take() {
-                    if self.work_tx.send(next).is_ok() {
-                        self.outstanding = 1;
-                    }
-                }
+            Ok(msg) => {
+                let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                    EmbeddingError::Ort("scoped refresh result lost its trigger frame".into())
+                })?;
+                self.outstanding = 0;
+                self.start_pending();
+                let (emb, f0_mu) = msg?;
                 Ok(Some((frame_idx, emb, f0_mu)))
             }
-            Ok(Err(e)) => Err(e),
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => {
                 Err(EmbeddingError::Ort("ECAPA worker disconnected".into()))
@@ -1424,15 +1585,13 @@ impl RefreshChannel for ScopedRefreshChannel {
                 .result_rx
                 .recv()
                 .map_err(|_| EmbeddingError::Ort("ECAPA worker disconnected".into()))?;
+            let frame_idx = self.refresh_frame_indices.pop_front().ok_or_else(|| {
+                EmbeddingError::Ort("scoped refresh result lost its trigger frame".into())
+            })?;
+            self.outstanding = 0;
+            self.start_pending();
             let (emb, f0_mu) = msg?;
-            let frame_idx = self.refresh_frame_indices.pop_front().unwrap_or(0);
-            self.outstanding -= 1;
             results.push((frame_idx, emb, f0_mu));
-            if let Some(next) = self.pending.take() {
-                if self.work_tx.send(next).is_ok() {
-                    self.outstanding = 1;
-                }
-            }
         }
         Ok(results)
     }
@@ -1446,6 +1605,8 @@ pub(crate) struct AsyncRefresh<'a> {
     pub(crate) channel: &'a mut dyn RefreshChannel,
     pub(crate) cohort: &'a [Vec<f32>],
     pub(crate) pool: &'a mut EmbeddingPool,
+    pub(crate) others: &'a mut OtherSpeakers,
+    pub(crate) other_cfg: OtherSpeakerConfig,
     pub(crate) enable_auto_learn: bool,
     pub(crate) score_ema_alpha: f32,
     pub(crate) gate_cfg: GateConfig,
@@ -1472,6 +1633,15 @@ impl RefreshStrategy for AsyncRefresh<'_> {
         out: &mut StreamingOutput,
     ) -> Result<(), PipelineError> {
         if let Some((trigger_frame, embedding, f0_mu)) = self.channel.try_recv_result()? {
+            score_and_learn_others(
+                &embedding,
+                self.pool.match_score(&embedding),
+                self.pool,
+                self.others,
+                &self.gate_cfg,
+                &self.other_cfg,
+                score,
+            );
             apply_refresh_result(
                 embedding,
                 f0_mu,
@@ -1520,6 +1690,7 @@ impl StreamingState {
     /// async streaming, call [`Self::new_async`] (and route through
     /// [`StreamingPipeline`] which owns the worker lifecycle).
     pub(crate) fn new(config: &StreamingConfig) -> Result<Self, PipelineError> {
+        validate_other_speaker_gate_config(&config.gate)?;
         if config.pipeline.async_refresh {
             return Err(PipelineError::Embedding(EmbeddingError::Ort(
                 "StreamingState::new requires async_refresh = false; \
@@ -1571,6 +1742,8 @@ impl StreamingState {
             consecutive_speech_ms: 0.0,
             score: ScoreState::new(),
             silence_ms_since_speech: 0.0,
+            awaiting_fresh_identity: None,
+            others: OtherSpeakers::new(),
             gate_state: GateState::new(config.gate),
             envelope_state: EnvelopeState::new(config.gate, audio_sr),
             current_decision: None,
@@ -1634,6 +1807,9 @@ impl StreamingState {
     /// Reset the carry-over state without touching pool or
     /// components. Used by [`StreamingPipeline::reset`].
     pub(crate) fn reset(&mut self, config: &StreamingConfig) {
+        if let Some(worker) = self.async_worker.as_mut() {
+            worker.discard_pending_and_drain();
+        }
         self.audio_ring.clear();
         if let Some(r) = self.resampler.as_mut() {
             r.reset();
@@ -1648,6 +1824,8 @@ impl StreamingState {
         self.consecutive_speech_ms = 0.0;
         self.score = ScoreState::new();
         self.silence_ms_since_speech = 0.0;
+        self.awaiting_fresh_identity = None;
+        self.others.reset();
         self.gate_state = GateState::new(config.gate);
         self.envelope_state = EnvelopeState::new(config.gate, config.audio_sample_rate);
         self.current_decision = None;
@@ -1655,17 +1833,28 @@ impl StreamingState {
         self.audio_samples_emitted = 0;
         self.fast_f0_cue.reset();
         self.turn.reset(config.pipeline.sv_window_samples);
-        // Stage C, Phase 5: drain the TSE/DFN3 chain accumulators and
-        // the pending-gain queue so a `reset()` is a clean restart
-        // even when neural processing is active.
+        // Stage C, Phase 5: reset every stateful adaptive-chain piece
+        // so a new session never inherits an overlap decision,
+        // hysteresis timer, transition, or recurrent model state.
         if let Some(stage) = self.tse_stage.as_mut() {
             stage.reset();
         }
         if let Some(stream) = self.dfn3_stream.as_mut() {
             stream.reset();
         }
+        if let Some(detector) = self.overlap_detector.as_mut() {
+            detector.reset();
+        }
         self.chain_pending_gain.clear();
         self.chain_pending_raw.clear();
+        self.chain_transition_remaining = 0;
+        self.chain_transition_total = 0;
+        self.chain_transition_prev_makeup_lin = 1.0;
+        self.chain_transition_prev_alpha = 1.0;
+        self.solo_output_rms_ema = 0.0;
+        self.chain_mode = ChainMode::Solo;
+        self.overlap_above_ms = 0.0;
+        self.overlap_below_ms = 0.0;
     }
 
     /// Push a decision-rate frame into the pre-roll lookback ring,
@@ -1847,6 +2036,31 @@ impl StreamingState {
             self.silence_ms_since_speech = 0.0;
         } else {
             self.silence_ms_since_speech += dt_ms;
+            // A pause this long is where a conversation changes hands.
+            // The identity window survives pauses (it accumulates speech
+            // frames only), so without this it would span both speakers
+            // and score neither — see `turn_boundary_silence_ms`. The
+            // emptiness check makes this fire once per gap.
+            //
+            // Armed only once somebody else has actually been heard.
+            // Re-qualifying costs the enrolled speaker roughly half a
+            // second of their own audio after every pause, and there is
+            // nothing to protect against until a second voice exists:
+            // measured on a solo session, arming this unconditionally
+            // cost ~13 % of the speaker's own output for no benefit.
+            // The other speaker's first turn is therefore still handled
+            // by scoring alone; from their second onward the purge is
+            // live.
+            if pipeline_cfg.turn_boundary_silence_ms > 0.0
+                && self.score.others_known
+                && self.silence_ms_since_speech >= pipeline_cfg.turn_boundary_silence_ms
+                && !self.speech_buffer.is_empty()
+            {
+                self.speech_buffer.clear();
+                self.pre_roll_ring.clear();
+                self.samples_since_update = 0;
+                self.awaiting_fresh_identity = Some(self.frame_idx);
+            }
         }
         self.prev_speech = now_speech;
         self.samples_since_update += vad_frame;
@@ -1905,7 +2119,21 @@ impl StreamingState {
         } else {
             pipeline_cfg.sv_update_samples
         };
-        let refresh_window = self.turn.effective_window;
+        // While re-qualifying after a turn-boundary purge the gate is
+        // shut, so the cost of waiting for a full window is paid in the
+        // enrolled speaker's own dead air. A half-length window is worth
+        // it here: measured against the profile's condition centroids, a
+        // 500 ms window still puts the enrolled speaker's median at
+        // 0.580 against an unrelated same-sex speaker's 95th percentile
+        // of 0.366. That is tighter than the full window manages and it
+        // halves the delay before their voice comes back.
+        let refresh_window = if self.awaiting_fresh_identity.is_some() {
+            pipeline_cfg
+                .sv_reopen_window_samples
+                .clamp(1, self.turn.effective_window)
+        } else {
+            self.turn.effective_window
+        };
 
         let due_normal = self.samples_since_update >= update_cadence;
         let due_early = self.silence_seen_since_refresh
@@ -1980,12 +2208,15 @@ impl StreamingState {
         // Overlap mode TSE has already been conditioned on the trusted
         // enrollment; scoring the louder raw mixture a second time is
         // both redundant and the main source of target-voice dropouts.
+        //
         let adaptive = self.adaptive_routing();
         if adaptive {
             self.update_chain_mode(decision_frame, dt_ms, config, out)?;
         }
 
-        let is_on_score = self.gate_state.update(gate_score, dt_ms, now_speech);
+        let is_on_score =
+            self.gate_state
+                .update_against(gate_score, self.score.last_other, dt_ms, now_speech);
         let silence_forced_off = pipeline_cfg.silence_force_off_ms > 0.0
             && self.silence_ms_since_speech >= pipeline_cfg.silence_force_off_ms;
         // Hold the overlap-bypass gate open across sub-hangover VAD
@@ -1995,6 +2226,17 @@ impl StreamingState {
             self.silence_ms_since_speech,
             config.gate.hangover_ms,
         );
+        // A refresh triggered at or after the speaker change has now
+        // been applied, so `last_score` finally describes the voice that
+        // is actually speaking. Release the fail-closed hold.
+        if let (Some(changed_at), Some(applied_at)) = (
+            self.awaiting_fresh_identity,
+            self.score.last_applied_trigger_frame,
+        ) {
+            if applied_at >= changed_at {
+                self.awaiting_fresh_identity = None;
+            }
+        }
         let is_on = final_gate_decision(
             adaptive,
             self.chain_mode,
@@ -2005,6 +2247,7 @@ impl StreamingState {
             // Stage B, Part 2: offset fail-closed — an extra AND term
             // parallel to the silence rule, outside `gate_state.update`.
             self.turn.offset_failclosed_active,
+            self.awaiting_fresh_identity.is_some(),
         );
         if config.diagnostics {
             out.gate_per_frame.push(is_on);
@@ -2408,18 +2651,26 @@ impl StreamingState {
             cohort,
             tse: _,
         } = components;
+        // Same take/restore dance as `async_worker`: the strategy needs
+        // `&mut` to the other-speaker model disjointly from `&mut self`.
+        let mut others = std::mem::take(&mut self.others);
         let mut strategy = SyncRefresh {
             fbank,
             ecapa,
             cohort,
             pool,
+            others: &mut others,
+            other_cfg: config.other_speakers,
             decision_sr: config.pipeline.sample_rate,
             enable_auto_learn: config.pipeline.enable_auto_learn,
             score_ema_alpha: config.pipeline.score_ema_alpha,
             use_as_norm: config.gate.use_as_norm,
             gate_cfg: config.gate,
         };
-        self.step_one_frame_core(audio_chunk, decision_frame, vad, &mut strategy, config, out)
+        let res =
+            self.step_one_frame_core(audio_chunk, decision_frame, vad, &mut strategy, config, out);
+        self.others = others;
+        res
     }
 
     /// Single VAD-frame iteration, async mode: builds an
@@ -2441,10 +2692,13 @@ impl StreamingState {
             .async_worker
             .take()
             .expect("step_one_frame_async requires an async worker");
+        let mut others = std::mem::take(&mut self.others);
         let mut strategy = AsyncRefresh {
             channel: &mut worker,
             cohort,
             pool,
+            others: &mut others,
+            other_cfg: config.other_speakers,
             enable_auto_learn: config.pipeline.enable_auto_learn,
             score_ema_alpha: config.pipeline.score_ema_alpha,
             gate_cfg: config.gate,
@@ -2452,6 +2706,7 @@ impl StreamingState {
         let res =
             self.step_one_frame_core(audio_chunk, decision_frame, vad, &mut strategy, config, out);
         self.async_worker = Some(worker);
+        self.others = others;
         res
     }
 
@@ -2473,6 +2728,14 @@ impl StreamingState {
         out: &mut StreamingOutput,
     ) -> Result<(), PipelineError> {
         for (trigger_frame, embedding, f0_mu) in channel.drain_blocking()? {
+            // Tail results still move `last_score`, so keep the
+            // other-speaker score it is compared against in step. No
+            // learning here: the run is over.
+            self.score.last_other = if config.gate.other_speaker_margin > 0.0 {
+                self.others.score(&embedding)
+            } else {
+                0.0
+            };
             apply_refresh_result(
                 embedding,
                 f0_mu,
@@ -2726,9 +2989,11 @@ impl StreamingPipeline {
     ///
     /// # Errors
     ///
-    /// Returns `PipelineError` if the resampler can't be built
-    /// (only when `audio_sample_rate != pipeline.sample_rate`), if
-    /// spawning the async worker fails, or — when
+    /// Returns `PipelineError` if the gate configuration combines an
+    /// enabled other-speaker margin with adaptive or AS-Norm scoring,
+    /// if the resampler can't be built (only when
+    /// `audio_sample_rate != pipeline.sample_rate`), if spawning the
+    /// async worker fails, or — when
     /// `config.pipeline.tse.is_some()` — if either the rate check
     /// (`PipelineError::TseRateMismatch`), the async-mode rejection
     /// (`PipelineError::TseAsyncUnsupported`), or the cond-embedding
@@ -2745,6 +3010,7 @@ impl StreamingPipeline {
         config: StreamingConfig,
         mut components: PipelineComponents,
     ) -> Result<Self, PipelineError> {
+        validate_other_speaker_gate_config(&config.gate)?;
         // Stage C, Phase 5 part 3 + Step 4: TSE wiring for streaming.
         // Both sync (`async_refresh=false`) and async
         // (`async_refresh=true`) paths now support TSE. The cond
@@ -2941,10 +3207,18 @@ impl StreamingPipeline {
     /// Apply gate/envelope settings without rebuilding ONNX sessions or
     /// resetting live state. This is safe between `push_samples` calls
     /// (the public API already requires `&mut self`).
-    pub fn set_gate_config(&mut self, gate: GateConfig) {
+    /// # Errors
+    ///
+    /// Returns [`PipelineError::InvalidGateConfig`] when the
+    /// other-speaker margin is combined with adaptive thresholding or
+    /// AS-Norm, or when the margin is not finite/non-negative. The
+    /// existing live configuration is left untouched on error.
+    pub fn set_gate_config(&mut self, gate: GateConfig) -> Result<(), PipelineError> {
+        validate_other_speaker_gate_config(&gate)?;
         self.config.gate = gate;
         self.state.gate_state.set_config(gate);
         self.state.envelope_state.set_config(gate);
+        Ok(())
     }
 
     /// Current gate configuration, including any live updates.
@@ -2965,10 +3239,15 @@ impl StreamingPipeline {
         self.state.gate_state.effective_theta_pass()
     }
 
-    /// Reset stateful pieces (rings, gate, envelope, frame index)
-    /// **without** rebuilding ONNX sessions or tearing down the
-    /// async worker thread (if any). Pool is preserved.
+    /// Reset stateful pieces (VAD, rings, gate, envelope, neural
+    /// streams, overlap routing, frame index and queued async results)
+    /// **without** rebuilding ONNX sessions or tearing down the async
+    /// worker thread (if any). Pool is preserved.
     pub fn reset(&mut self) {
+        match &mut self.components {
+            ComponentsStorage::Sync(components) => components.vad.reset(),
+            ComponentsStorage::Async { vad, .. } => vad.reset(),
+        }
         self.state.reset(&self.config);
     }
 
@@ -3055,26 +3334,94 @@ mod tests {
         assert!((just_above - just_below - 2.0e-4).abs() < 1.0e-6);
     }
 
+    /// Named-argument view of [`final_gate_decision`] for the tests —
+    /// eight positional bools at the call site is unreadable.
+    #[derive(Clone, Copy)]
+    #[allow(clippy::struct_excessive_bools)]
+    struct GateInputs {
+        adaptive: bool,
+        chain_mode: ChainMode,
+        overlap_bypass: bool,
+        speech_with_hangover: bool,
+        is_on_score: bool,
+        silence_forced_off: bool,
+        turn_forced_off: bool,
+        change_forced_off: bool,
+    }
+
+    impl GateInputs {
+        /// Adaptive routing in Overlap mode with the bypass on — the
+        /// configuration the live GUI runs.
+        fn overlap_bypass() -> Self {
+            Self {
+                adaptive: true,
+                chain_mode: ChainMode::Overlap,
+                overlap_bypass: true,
+                speech_with_hangover: true,
+                is_on_score: false,
+                silence_forced_off: false,
+                turn_forced_off: false,
+                change_forced_off: false,
+            }
+        }
+
+        fn solo() -> Self {
+            Self {
+                chain_mode: ChainMode::Solo,
+                ..Self::overlap_bypass()
+            }
+        }
+
+        fn decide(self) -> bool {
+            final_gate_decision(
+                self.adaptive,
+                self.chain_mode,
+                self.overlap_bypass,
+                self.speech_with_hangover,
+                self.is_on_score,
+                self.silence_forced_off,
+                self.turn_forced_off,
+                self.change_forced_off,
+            )
+        }
+    }
+
     #[test]
     fn overlap_bypass_uses_tse_vad_instead_of_raw_mixture_score() {
-        assert!(final_gate_decision(
-            true,
-            ChainMode::Overlap,
-            true,
-            true,
-            false,
-            false,
-            false,
-        ));
-        assert!(!final_gate_decision(
-            true,
-            ChainMode::Overlap,
-            true,
-            false,
-            true,
-            false,
-            false,
-        ));
+        assert!(GateInputs::overlap_bypass().decide());
+        assert!(!GateInputs {
+            speech_with_hangover: false,
+            is_on_score: true,
+            ..GateInputs::overlap_bypass()
+        }
+        .decide());
+    }
+
+    #[test]
+    fn speaker_change_fails_closed_through_every_branch() {
+        // While the identity window straddles a turn change its score
+        // describes neither speaker, so no other evidence — not the
+        // score, not "somebody is talking" under the overlap bypass —
+        // may open the gate.
+        assert!(!GateInputs {
+            change_forced_off: true,
+            ..GateInputs::overlap_bypass()
+        }
+        .decide());
+        assert!(!GateInputs {
+            is_on_score: true,
+            change_forced_off: true,
+            ..GateInputs::solo()
+        }
+        .decide());
+        // And it must not latch: clearing it restores the ordinary
+        // decision rather than leaving the gate shut.
+        assert!(GateInputs {
+            is_on_score: true,
+            change_forced_off: false,
+            ..GateInputs::solo()
+        }
+        .decide());
     }
 
     #[test]
@@ -3097,37 +3444,22 @@ mod tests {
     fn overlap_bypass_still_closes_on_forced_silence() {
         // The VAD hangover must not outlive `silence_force_off_ms` —
         // otherwise a stale decision holds the gate open in a quiet room.
-        assert!(!final_gate_decision(
-            true,
-            ChainMode::Overlap,
-            true,
-            true,
-            true,
-            true,
-            false,
-        ));
+        assert!(!GateInputs {
+            is_on_score: true,
+            silence_forced_off: true,
+            ..GateInputs::overlap_bypass()
+        }
+        .decide());
     }
 
     #[test]
     fn solo_mode_always_keeps_voiceprint_fail_closed() {
-        assert!(!final_gate_decision(
-            true,
-            ChainMode::Solo,
-            true,
-            true,
-            false,
-            false,
-            false,
-        ));
-        assert!(final_gate_decision(
-            true,
-            ChainMode::Solo,
-            true,
-            true,
-            true,
-            false,
-            false,
-        ));
+        assert!(!GateInputs::solo().decide());
+        assert!(GateInputs {
+            is_on_score: true,
+            ..GateInputs::solo()
+        }
+        .decide());
     }
 
     #[test]
@@ -3155,6 +3487,32 @@ mod tests {
             .chain_pending_raw
             .extend(std::iter::repeat(0.0).take(n));
         (state, cfg)
+    }
+
+    #[test]
+    fn reset_clears_adaptive_chain_routing_state() {
+        let (mut state, cfg) = state_with_pending_chain_samples(8);
+        state.chain_transition_remaining = 7;
+        state.chain_transition_total = 9;
+        state.chain_transition_prev_makeup_lin = 1.7;
+        state.chain_transition_prev_alpha = 0.4;
+        state.solo_output_rms_ema = 0.25;
+        state.chain_mode = ChainMode::Overlap;
+        state.overlap_above_ms = 500.0;
+        state.overlap_below_ms = 250.0;
+
+        state.reset(&cfg);
+
+        assert!(state.chain_pending_gain.is_empty());
+        assert!(state.chain_pending_raw.is_empty());
+        assert_eq!(state.chain_transition_remaining, 0);
+        assert_eq!(state.chain_transition_total, 0);
+        assert_eq!(state.chain_transition_prev_makeup_lin, 1.0);
+        assert_eq!(state.chain_transition_prev_alpha, 1.0);
+        assert_eq!(state.solo_output_rms_ema, 0.0);
+        assert_eq!(state.chain_mode, ChainMode::Solo);
+        assert_eq!(state.overlap_above_ms, 0.0);
+        assert_eq!(state.overlap_below_ms, 0.0);
     }
 
     #[test]
@@ -3576,6 +3934,134 @@ mod tests {
         }
         assert_eq!(edges, 1, "due_turn must fire exactly once per turn");
         assert_eq!(det.state, TurnState::Shrunk);
+    }
+
+    #[test]
+    fn scoped_refresh_overwrite_keeps_window_and_trigger_together() {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+        let mut channel = ScopedRefreshChannel::new(work_tx, result_rx);
+
+        channel.submit(vec![1.0], 10);
+        channel.submit(vec![2.0], 20);
+        channel.submit(vec![3.0], 30); // replaces the entire pending job
+        assert_eq!(work_rx.recv().unwrap(), vec![1.0]);
+
+        result_tx.send(Ok((vec![101.0], 1.0))).unwrap();
+        let first = channel.try_recv_result().unwrap().unwrap();
+        assert_eq!(first.0, 10);
+        assert_eq!(work_rx.recv().unwrap(), vec![3.0]);
+
+        result_tx.send(Ok((vec![103.0], 3.0))).unwrap();
+        let latest = channel.try_recv_result().unwrap().unwrap();
+        assert_eq!(latest.0, 30, "overwritten frame 20 must not survive");
+        assert_eq!(latest.1, vec![103.0]);
+        assert_eq!(channel.outstanding, 0);
+        assert!(channel.refresh_frame_indices.is_empty());
+    }
+
+    #[test]
+    fn scoped_refresh_error_still_advances_the_pending_job() {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+        let mut channel = ScopedRefreshChannel::new(work_tx, result_rx);
+        channel.submit(vec![1.0], 10);
+        channel.submit(vec![2.0], 20);
+        assert_eq!(work_rx.recv().unwrap(), vec![1.0]);
+
+        result_tx
+            .send(Err(EmbeddingError::Ort("synthetic".into())))
+            .unwrap();
+        assert!(channel.try_recv_result().is_err());
+        assert_eq!(work_rx.recv().unwrap(), vec![2.0]);
+
+        result_tx.send(Ok((vec![102.0], 2.0))).unwrap();
+        let second = channel.try_recv_result().unwrap().unwrap();
+        assert_eq!(second.0, 20);
+        assert_eq!(channel.outstanding, 0);
+    }
+
+    #[test]
+    fn async_worker_reset_discards_completed_and_pending_old_jobs() {
+        let (work_tx, work_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+        let (result_tx, result_rx) =
+            std::sync::mpsc::channel::<Result<(Vec<f32>, f32), EmbeddingError>>();
+        let mut worker = AsyncWorker {
+            work_tx,
+            result_rx,
+            join: None,
+            outstanding: 0,
+            pending: None,
+            refresh_frame_indices: VecDeque::new(),
+        };
+
+        worker.submit(vec![1.0], 10);
+        worker.submit(vec![2.0], 20);
+        assert_eq!(work_rx.recv().unwrap(), vec![1.0]);
+        result_tx.send(Ok((vec![101.0], 1.0))).unwrap();
+
+        // The first result is complete but unpolled, and the second job
+        // is still queued. A session reset must discard both without
+        // dispatching the pending job.
+        worker.discard_pending_and_drain();
+        assert_eq!(worker.outstanding, 0);
+        assert!(worker.pending.is_none());
+        assert!(worker.refresh_frame_indices.is_empty());
+        assert!(matches!(
+            work_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        // The channel remains usable, and a new-session job keeps its
+        // own trigger frame rather than inheriting frame 10 or 20.
+        worker.submit(vec![3.0], 30);
+        assert_eq!(work_rx.recv().unwrap(), vec![3.0]);
+        result_tx.send(Ok((vec![103.0], 3.0))).unwrap();
+        let fresh = worker.try_recv_result().unwrap().unwrap();
+        assert_eq!(fresh.0, 30);
+        assert_eq!(fresh.1, vec![103.0]);
+    }
+
+    #[test]
+    fn other_speaker_margin_rejects_incompatible_score_modes() {
+        let fixed = GateConfig {
+            theta_pass: 0.45,
+            adaptive_theta: false,
+            other_speaker_margin: 0.08,
+            ..GateConfig::default()
+        };
+        assert!(validate_other_speaker_gate_config(&fixed).is_ok());
+
+        let adaptive = GateConfig {
+            adaptive_theta: true,
+            ..fixed
+        };
+        assert!(matches!(
+            validate_other_speaker_gate_config(&adaptive),
+            Err(PipelineError::InvalidGateConfig(_))
+        ));
+
+        let as_norm = GateConfig {
+            use_as_norm: true,
+            ..fixed
+        };
+        assert!(matches!(
+            validate_other_speaker_gate_config(&as_norm),
+            Err(PipelineError::InvalidGateConfig(_))
+        ));
+
+        for margin in [f32::NAN, f32::INFINITY, -0.1] {
+            let invalid = GateConfig {
+                other_speaker_margin: margin,
+                ..fixed
+            };
+            assert!(matches!(
+                validate_other_speaker_gate_config(&invalid),
+                Err(PipelineError::InvalidGateConfig(_))
+            ));
+        }
     }
 
     #[test]
